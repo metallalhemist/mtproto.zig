@@ -33,7 +33,7 @@ This project is a high-performance MTProto proxy that mimics a standard TLS 1.3 
 ## Building and Running
 
 ### Prerequisites
-- Zig 0.13.0+
+- Zig 0.15.0+
 
 ### Key Commands
 

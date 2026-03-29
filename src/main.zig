@@ -13,25 +13,199 @@ const proxy = @import("proxy/proxy.zig");
 
 const log = std.log.scoped(.mtproto);
 
+const version = "0.1.0";
+
+// ============= Output Helpers (Zig 0.15 compatible) =============
+
+/// Write a formatted string to stdout via posix write.
+fn writeStdout(comptime fmt: []const u8, args: anytype) void {
+    var buf: [4096]u8 = undefined;
+    const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    _ = std.posix.write(std.posix.STDOUT_FILENO, slice) catch return;
+}
+
+/// Write a formatted string to stderr.
+fn writeStderr(comptime fmt: []const u8, args: anytype) void {
+    var buf: [4096]u8 = undefined;
+    const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    _ = std.posix.write(std.posix.STDERR_FILENO, slice) catch return;
+}
+
+/// Write a hex byte to stdout.
+fn writeHexByte(byte: u8) void {
+    const hex = "0123456789abcdef";
+    const out = [2]u8{ hex[byte >> 4], hex[byte & 0x0f] };
+    _ = std.posix.write(std.posix.STDOUT_FILENO, &out) catch return;
+}
+
+/// Write raw string to stdout.
+fn writeRaw(s: []const u8) void {
+    _ = std.posix.write(std.posix.STDOUT_FILENO, s) catch return;
+}
+
+// ============= Public IP Detection =============
+
+/// Try to detect the server's public IP address via external services.
+/// Returns the IP string (caller owns memory) or null on failure.
+fn detectPublicIp(allocator: std.mem.Allocator) ?[]const u8 {
+    // Try multiple services in order
+    const services = [_][]const []const u8{
+        &.{ "curl", "-s", "--max-time", "3", "https://ifconfig.me" },
+        &.{ "curl", "-s", "--max-time", "3", "https://api.ipify.org" },
+        &.{ "curl", "-s", "--max-time", "3", "https://icanhazip.com" },
+    };
+
+    for (services) |argv| {
+        const result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = argv,
+        }) catch continue;
+
+        defer allocator.free(result.stderr);
+
+        const stdout = result.stdout;
+        // Trim whitespace/newlines
+        const trimmed = std.mem.trim(u8, stdout, &[_]u8{ ' ', '\t', '\n', '\r' });
+        if (trimmed.len == 0 or trimmed.len > 45) {
+            allocator.free(stdout);
+            continue;
+        }
+
+        // Basic validation: should look like an IP
+        if (std.mem.indexOfScalar(u8, trimmed, '.') != null or
+            std.mem.indexOfScalar(u8, trimmed, ':') != null)
+        {
+            // If trimmed is a sub-slice of stdout, dupe it so we can free stdout
+            const ip = allocator.dupe(u8, trimmed) catch {
+                allocator.free(stdout);
+                continue;
+            };
+            allocator.free(stdout);
+            return ip;
+        }
+        allocator.free(stdout);
+    }
+    return null;
+}
+
+// ============= Startup Banner =============
+
+/// Print a stylish startup banner with config summary and connection links.
+fn printBanner(allocator: std.mem.Allocator, cfg: config.Config) void {
+    const R = "\x1b[0m";
+    const B = "\x1b[1m";
+    const D = "\x1b[2m";
+    const cyan = "\x1b[36m";
+    const green = "\x1b[32m";
+    const yellow = "\x1b[33m";
+    const magenta = "\x1b[35m";
+    const white = "\x1b[97m";
+    const red = "\x1b[31m";
+
+    // Detect public IP
+    writeRaw("\n" ++ D ++ "  Detecting public IP..." ++ R);
+    const public_ip = detectPublicIp(allocator);
+    defer if (public_ip) |ip| allocator.free(ip);
+    writeRaw("\r\x1b[K");
+
+    const server_ip = public_ip orelse "<SERVER_IP>";
+
+    // Logo
+    writeRaw("\n" ++ B ++ cyan);
+    writeRaw("       __  __ _____ ____            _\n");
+    writeRaw("      |  \\/  |_   _|  _ \\ _ __ ___ | |_ ___\n");
+    writeRaw("      | |\\/| | | | | |_) | '__/ _ \\| __/ _ \\\n");
+    writeRaw("      | |  | | | | |  __/| | | (_) | || (_) |\n");
+    writeRaw("      |_|  |_| |_| |_|   |_|  \\___/ \\__\\___/\n");
+    writeRaw(R);
+    writeStdout("      {s}{s}proxy · zig edition · v{s}{s}\n\n", .{ D, white, version, R });
+
+    // ─── SERVER ─────────────────────────────────────
+    writeRaw("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "SERVER" ++ R ++ " " ++ D ++ "──────────────────────────────────────" ++ R ++ "\n");
+    writeStdout("      Listen       " ++ B ++ green ++ "0.0.0.0:{d}" ++ R ++ "\n", .{cfg.port});
+    writeStdout("      Public IP    " ++ B ++ "{s}{s}" ++ R ++ "\n", .{
+        if (public_ip != null) green else yellow,
+        server_ip,
+    });
+    writeStdout("      TLS Domain   " ++ B ++ yellow ++ "{s}" ++ R ++ "\n", .{cfg.tls_domain});
+    writeRaw("      Masking      " ++ B);
+    if (cfg.mask) {
+        writeRaw(green ++ "enabled");
+    } else {
+        writeRaw(yellow ++ "disabled");
+    }
+    writeRaw(R ++ "\n\n");
+
+    // ─── USERS ──────────────────────────────────────
+    writeStdout("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "USERS" ++ R ++ " ({d}) " ++ D ++ "────────────────────────────────────" ++ R ++ "\n", .{cfg.users.count()});
+    var it = @constCast(&cfg.users).iterator();
+    while (it.next()) |entry| {
+        writeStdout("      " ++ green ++ "●" ++ R ++ " " ++ B ++ "{s}" ++ R ++ "  " ++ D, .{entry.key_ptr.*});
+        for (entry.value_ptr.*) |byte| {
+            writeHexByte(byte);
+        }
+        writeRaw(R ++ "\n");
+    }
+    writeRaw("\n");
+
+    // ─── LINKS ──────────────────────────────────────
+    writeRaw("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "LINKS" ++ R ++ " " ++ D ++ "──────────────────────────────────────" ++ R ++ "\n");
+    if (public_ip == null) {
+        writeRaw("      " ++ red ++ "⚠  Could not detect IP. Replace <SERVER_IP> manually." ++ R ++ "\n");
+    }
+
+    var it2 = @constCast(&cfg.users).iterator();
+    while (it2.next()) |entry| {
+        writeStdout("      " ++ B ++ magenta ++ "{s}" ++ R ++ "\n", .{entry.key_ptr.*});
+
+        // tg:// deep link
+        writeStdout("      " ++ cyan ++ "tg://" ++ R ++ "proxy?server={s}&port={d}&secret=", .{ server_ip, cfg.port });
+        writeRaw(green ++ "ee");
+        for (entry.value_ptr.*) |byte| {
+            writeHexByte(byte);
+        }
+        for (cfg.tls_domain) |byte| {
+            writeHexByte(byte);
+        }
+        writeRaw(R ++ "\n");
+
+        // t.me link
+        writeStdout("      " ++ D ++ "t.me/proxy?server={s}&port={d}&secret=ee", .{ server_ip, cfg.port });
+        for (entry.value_ptr.*) |byte| {
+            writeHexByte(byte);
+        }
+        for (cfg.tls_domain) |byte| {
+            writeHexByte(byte);
+        }
+        writeRaw(R ++ "\n");
+    }
+
+    // Footer
+    writeRaw("\n  " ++ D ++ "──────────────────────────────────────────────────" ++ R ++ "\n");
+    writeRaw("  " ++ B ++ cyan ++ "⏳ Waiting for connections..." ++ R ++ "\n\n");
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    log.info("mtproto-proxy v0.1.0", .{});
+    // Parse config path from args
+    var args = try std.process.argsWithAllocator(allocator);
+    defer args.deinit();
+    _ = args.next(); // skip program name
+    const config_path = args.next() orelse "config.toml";
 
     // Parse config
-    const cfg = config.Config.loadFromFile(allocator, "config.toml") catch |err| {
-        log.err("Failed to load config: {}", .{err});
-        log.err("Usage: mtproto-proxy [config.toml]", .{});
+    const cfg = config.Config.loadFromFile(allocator, config_path) catch |err| {
+        writeStderr("\x1b[1m\x1b[31m  ✗ Failed to load config '{s}': {}\x1b[0m\n", .{ config_path, err });
+        writeStderr("\n  Usage: mtproto-proxy [config.toml]\n\n", .{});
         return;
     };
     defer cfg.deinit(allocator);
 
-    log.info("Loaded {d} user(s), listening on port {d}", .{
-        cfg.users.count(),
-        cfg.port,
-    });
+    // Print the startup banner (includes IP detection)
+    printBanner(allocator, cfg);
 
     // Create shared state (DI — no globals)
     var state = proxy.ProxyState.init(allocator, cfg);

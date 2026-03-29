@@ -1,0 +1,9 @@
+[server]
+port = 8443
+
+[censorship]
+tls_domain = "wb.ru"
+mask = true
+
+[access.users]
+alexander = "0b513f6e83524354984a8835939fa9af"
