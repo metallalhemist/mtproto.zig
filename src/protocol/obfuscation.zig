@@ -53,6 +53,7 @@ pub const ObfuscationParams = struct {
 
             // Decrypt the handshake to check proto tag
             var decryptor = crypto.AesCtr.init(&decrypt_key, decrypt_iv);
+            defer decryptor.wipe();
             var decrypted: [constants.handshake_len]u8 = undefined;
             @memcpy(&decrypted, handshake);
             decryptor.apply(&decrypted);

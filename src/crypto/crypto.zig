@@ -16,13 +16,16 @@ const Aes256 = std.crypto.core.aes.Aes256;
 pub const AesCtr = struct {
     key: [32]u8,
     /// Cached expanded key schedule (avoids re-computing on every apply())
-    enc_ctx: @TypeOf(Aes256.initEnc([_]u8{0} ** 32)),
+    enc_ctx: EncCtx,
     /// Current counter value (big-endian u128)
     ctr: u128,
     /// Buffered keystream block
     buffer: [16]u8 = undefined,
     /// How many bytes remain in current keystream block
     buffer_pos: u8 = 16, // start exhausted so first call generates
+
+    /// Expanded AES-256 encryption context type (backend-independent)
+    const EncCtx = @TypeOf(Aes256.initEnc([_]u8{0} ** 32));
 
     pub fn init(key: *const [32]u8, iv: u128) AesCtr {
         return .{
@@ -77,11 +80,11 @@ pub const AesCtr = struct {
 
     /// Securely wipe key material.
     pub fn wipe(self: *AesCtr) void {
-        @memset(&self.key, 0);
-        @memset(&self.buffer, 0);
+        std.crypto.secureZero(u8, &self.key);
+        std.crypto.secureZero(u8, &self.buffer);
         self.ctr = 0;
         // Wipe expanded key schedule
-        self.enc_ctx = Aes256.initEnc([_]u8{0} ** 32);
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.enc_ctx));
     }
 };
 
@@ -166,8 +169,8 @@ pub const AesCbc = struct {
     }
 
     pub fn wipe(self: *AesCbc) void {
-        @memset(&self.key, 0);
-        @memset(&self.iv, 0);
+        std.crypto.secureZero(u8, &self.key);
+        std.crypto.secureZero(u8, &self.iv);
     }
 };
 

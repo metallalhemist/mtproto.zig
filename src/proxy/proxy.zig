@@ -17,6 +17,10 @@ const log = std.log.scoped(.proxy);
 const tls_header_len = 5;
 /// Maximum TLS payload we'll write in one record
 const max_tls_payload = constants.max_tls_ciphertext_size;
+/// Idle timeout for relay poll() and write backpressure (5 minutes)
+const relay_timeout_ms = 5 * 60 * 1000;
+/// Handshake read timeout applied via SO_RCVTIMEO (seconds)
+const handshake_timeout_sec = 30;
 
 // ============= Dynamic Record Sizing (DRS) =============
 
@@ -151,6 +155,10 @@ fn handleConnectionInner(
     client_stream: net.Stream,
     conn_id: u64,
 ) !void {
+    // Apply receive timeout to protect against Slowloris-style attacks.
+    // Blocks the handshake phase from holding a thread indefinitely.
+    setRecvTimeout(client_stream.handle, handshake_timeout_sec);
+
     // Read first 5 bytes to determine TLS vs direct
     var first_bytes: [5]u8 = undefined;
     const n = try readExact(client_stream, &first_bytes);
@@ -376,8 +384,8 @@ fn relayBidirectional(
     var dc_read_buf: [constants.default_buffer_size]u8 = undefined;
 
     while (true) {
-        const ready = try posix.poll(&fds, -1);
-        if (ready == 0) continue;
+        const ready = try posix.poll(&fds, relay_timeout_ms);
+        if (ready == 0) return error.ConnectionReset; // idle timeout — close ghost connection
 
         // Check for errors/hangup first
         if (fds[0].revents & (posix.POLL.ERR | posix.POLL.HUP) != 0) return;
@@ -415,6 +423,7 @@ fn relayBidirectional(
 /// C2S direction: Read TLS records from client, unwrap, AES-CTR decrypt, re-encrypt for DC, send.
 ///
 /// Uses incremental state so partial reads across poll iterations are handled correctly.
+/// Both CCS and Application Data records share the same body buffer to survive WouldBlock.
 fn relayClientToDc(
     client: net.Stream,
     dc: net.Stream,
@@ -446,40 +455,21 @@ fn relayClientToDc(
                 return error.ConnectionReset;
             }
 
-            if (record_type == constants.tls_record_change_cipher) {
-                // CCS: read and discard the body (variable length, not always 1 byte)
-                const ccs_body_len = std.mem.readInt(u16, tls_hdr_buf[3..5], .big);
-                if (ccs_body_len > max_tls_payload) return error.ConnectionReset;
-                var ccs_discard_pos: usize = 0;
-                while (ccs_discard_pos < ccs_body_len) {
-                    var discard_buf: [256]u8 = undefined;
-                    const to_read = @min(ccs_body_len - ccs_discard_pos, discard_buf.len);
-                    const dn = client.read(discard_buf[0..to_read]) catch |err| {
-                        return if (err == error.WouldBlock) {} else err;
-                    };
-                    if (dn == 0) return error.ConnectionReset;
-                    ccs_discard_pos += dn;
+            if (record_type == constants.tls_record_change_cipher or
+                record_type == constants.tls_record_application)
+            {
+                tls_body_len.* = std.mem.readInt(u16, tls_hdr_buf[3..5], .big);
+                if (tls_body_len.* == 0 or tls_body_len.* > max_tls_payload) {
+                    return error.ConnectionReset;
                 }
-                // Reset for next record
-                tls_hdr_pos.* = 0;
                 tls_body_pos.* = 0;
-                tls_body_len.* = 0;
-                continue;
-            }
-
-            if (record_type != constants.tls_record_application) {
+            } else {
                 // Unexpected record type
                 return error.ConnectionReset;
             }
-
-            tls_body_len.* = std.mem.readInt(u16, tls_hdr_buf[3..5], .big);
-            if (tls_body_len.* == 0 or tls_body_len.* > max_tls_payload) {
-                return error.ConnectionReset;
-            }
-            tls_body_pos.* = 0;
         }
 
-        // Reading TLS record body
+        // Reading TLS record body (shared path for CCS and Application Data)
         const remaining = tls_body_len.* - tls_body_pos.*;
         if (remaining == 0) {
             // Record complete, reset for next
@@ -497,7 +487,16 @@ fn relayClientToDc(
 
         if (tls_body_pos.* < tls_body_len.*) return; // need more body bytes
 
-        // Complete TLS record received — process it
+        // Full record body received — check record type
+        if (tls_hdr_buf[0] == constants.tls_record_change_cipher) {
+            // CCS record fully read — discard body and reset for next record
+            tls_hdr_pos.* = 0;
+            tls_body_pos.* = 0;
+            tls_body_len.* = 0;
+            continue;
+        }
+
+        // Application Data record — decrypt, re-encrypt, forward
         const payload = tls_body_buf[0..tls_body_len.*];
 
         // AES-CTR decrypt (client obfuscation layer)
@@ -561,11 +560,25 @@ fn relayDcToClient(
     }
 }
 
-/// Write all bytes to a stream, handling partial writes.
+/// Write all bytes to a stream, handling partial writes and backpressure.
+/// On non-blocking sockets, waits for POLLOUT when the send buffer is full.
 fn writeAll(stream: net.Stream, data: []const u8) !void {
     var written: usize = 0;
     while (written < data.len) {
-        const nw = stream.write(data[written..]) catch |err| return err;
+        const nw = stream.write(data[written..]) catch |err| {
+            if (err == error.WouldBlock) {
+                // Wait for the socket to become writable
+                var fds = [1]posix.pollfd{
+                    .{ .fd = stream.handle, .events = posix.POLL.OUT, .revents = 0 },
+                };
+                const ready = try posix.poll(&fds, relay_timeout_ms);
+                if (ready == 0) return error.ConnectionReset; // write timeout
+                if (fds[0].revents & (posix.POLL.ERR | posix.POLL.HUP) != 0)
+                    return error.ConnectionReset;
+                continue;
+            }
+            return err;
+        };
         if (nw == 0) return error.ConnectionReset;
         written += nw;
     }
@@ -588,8 +601,15 @@ fn readExact(stream: net.Stream, buf: []u8) !usize {
 /// Set a file descriptor to non-blocking mode.
 fn setNonBlocking(fd: posix.fd_t) void {
     var fl_flags = posix.fcntl(fd, posix.F.GETFL, 0) catch return;
-    fl_flags |= 1 << @bitOffsetOf(posix.O, "NONBLOCK");
+    const nonblock: @TypeOf(fl_flags) = @bitCast(@as(u64, @as(u32, @bitCast(posix.O{ .NONBLOCK = true }))));
+    fl_flags |= nonblock;
     _ = posix.fcntl(fd, posix.F.SETFL, fl_flags) catch return;
+}
+
+/// Set SO_RCVTIMEO on a socket to limit blocking reads (anti-Slowloris).
+fn setRecvTimeout(fd: posix.fd_t, timeout_sec: u32) void {
+    const tv = posix.timeval{ .sec = @intCast(timeout_sec), .usec = 0 };
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch return;
 }
 
 test "ProxyState init/deinit" {
