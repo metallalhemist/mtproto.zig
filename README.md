@@ -6,6 +6,10 @@
 
 Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorship.
 
+<p align="center">
+  <strong>126 KB binary. ~120 KB RAM. Boots in <2 ms. Zero dependencies.</strong>
+</p>
+
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Zig](https://img.shields.io/badge/zig-0.15.2-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
 [![LOC](https://img.shields.io/badge/lines_of_code-1.7k-informational)](src/)
@@ -57,6 +61,21 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 > **Layer 3 -- DC Relay** &nbsp; The proxy connects to the target Telegram datacenter (DC1-DC5), performs its own obfuscated handshake, and relays traffic between client and DC with re-encryption.
 
 > **Anti-censorship -- Masking** &nbsp; When an unauthenticated client connects (e.g. a DPI active probe), the proxy transparently forwards the connection to the real `tls_domain` (e.g. `wb.ru`). The prober receives a genuine TLS certificate and HTTP response, making the proxy indistinguishable from a real web server.
+
+## &nbsp; Benchmark Snapshot
+
+Measured locally (ReleaseSmall) and on a 1 vCPU Linux VPS under load.
+
+| | [mtprotoproxy](https://github.com/alexbers/mtprotoproxy) | [telemt](https://github.com/telemt/telemt) | **[mtproto.zig](https://github.com/sleep3r/mtproto.zig)** |
+|---|---|---|---|
+| **Language** | Python | Rust | **Zig** |
+| **RAM (Peak)** | > 50 MB | ~11.6 MB | **~6.8 MB** |
+| **RAM (Idle)**  | ~30 MB | ~3.0 MB | **~120 KB** |
+| **Binary Size** | N/A (Scripts) | ~17.0 MB | **126 KB** |
+| **Dependencies**| `cryptography`, `uvloop` | 150+ Crates | **0 (None)** |
+
+> Measured via systemd status and `/usr/bin/time -v` on an Ubuntu 24.04 server.
+> `mtproto.zig` is compiled statically via `zig build -Doptimize=ReleaseSmall -Dtarget=x86_64-linux` and uses the standard library entirely for its cryptography, handshakes, and event loops.
 
 ## &nbsp; Quick Start
 
