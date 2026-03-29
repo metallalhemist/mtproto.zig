@@ -26,11 +26,13 @@ fmt:
 	zig fmt src/
 
 # Deploy to VPS (cross-compiles for Linux, uploads, and restarts service)
+# Stops the service first because the systemd unit sets ReadOnlyPaths=/opt/mtproto-proxy
 SERVER ?= 45.77.223.232
 deploy: release_linux
 	@echo "Deploying to $(SERVER)..."
+	ssh root@$(SERVER) 'systemctl stop mtproto-proxy'
 	scp zig-out/bin/mtproto-proxy root@$(SERVER):/opt/mtproto-proxy/
-	ssh root@$(SERVER) 'systemctl restart mtproto-proxy && systemctl status mtproto-proxy --no-pager'
+	ssh root@$(SERVER) 'systemctl start mtproto-proxy && systemctl status mtproto-proxy --no-pager'
 
 # Cross-compile for Linux (x86_64)
 release_linux:
