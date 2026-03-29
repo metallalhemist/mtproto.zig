@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+#
+# MTProto Proxy — one-line installer for Linux (Ubuntu/Debian)
+#
+# Usage:
+#   curl -sSf https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/install.sh | sudo bash
+#
+# What it does:
+#   1. Installs Zig 0.15.2 (if not present)
+#   2. Clones and builds the proxy
+#   3. Generates a random user secret
+#   4. Creates a systemd service
+#   5. Opens port 443 in ufw (if active)
+#   6. Prints the ready-to-use tg:// link
+
+set -euo pipefail
+
+ZIG_VERSION="0.15.2"
+INSTALL_DIR="/opt/mtproto-proxy"
+REPO_URL="https://github.com/sleep3r/mtproto.zig.git"
+SERVICE_NAME="mtproto-proxy"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+info()  { echo -e "${CYAN}▸${RESET} $*"; }
+ok()    { echo -e "${GREEN}✓${RESET} $*"; }
+fail()  { echo -e "${RED}✗${RESET} $*" >&2; exit 1; }
+
+# ── Check root ──────────────────────────────────────────────
+[[ $EUID -eq 0 ]] || fail "Run as root: sudo bash install.sh"
+
+# ── Install Zig ─────────────────────────────────────────────
+if command -v zig &>/dev/null && zig version 2>/dev/null | grep -q "$ZIG_VERSION"; then
+    ok "Zig $ZIG_VERSION already installed"
+else
+    info "Installing Zig $ZIG_VERSION..."
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64)  ZIG_ARCH="x86_64" ;;
+        aarch64) ZIG_ARCH="aarch64" ;;
+        *)       fail "Unsupported architecture: $ARCH" ;;
+    esac
+
+    ZIG_TAR="zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
+    ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TAR}"
+
+    cd /tmp
+    curl -sSfL -o "$ZIG_TAR" "$ZIG_URL"
+    tar xf "$ZIG_TAR"
+    rm -rf /usr/local/zig
+    mv "zig-linux-${ZIG_ARCH}-${ZIG_VERSION}" /usr/local/zig
+    ln -sf /usr/local/zig/zig /usr/local/bin/zig
+    rm -f "$ZIG_TAR"
+    ok "Zig $ZIG_VERSION installed to /usr/local/zig"
+fi
+
+# ── Clone & build ───────────────────────────────────────────
+info "Building mtproto-proxy..."
+TMPBUILD=$(mktemp -d)
+git clone --depth 1 "$REPO_URL" "$TMPBUILD"
+cd "$TMPBUILD"
+zig build -Doptimize=ReleaseFast
+ok "Build complete"
+
+# ── Install binary ──────────────────────────────────────────
+info "Installing to $INSTALL_DIR..."
+mkdir -p "$INSTALL_DIR"
+cp zig-out/bin/mtproto-proxy "$INSTALL_DIR/mtproto-proxy"
+chmod +x "$INSTALL_DIR/mtproto-proxy"
+
+# ── Generate config (if not exists) ─────────────────────────
+if [[ ! -f "$INSTALL_DIR/config.toml" ]]; then
+    SECRET=$(openssl rand -hex 16)
+    TLS_DOMAIN="google.com"
+
+    cat > "$INSTALL_DIR/config.toml" <<EOF
+[server]
+port = 443
+
+[censorship]
+tls_domain = "$TLS_DOMAIN"
+mask = true
+
+[access.users]
+user = "$SECRET"
+EOF
+    ok "Generated config with new secret"
+else
+    ok "Config already exists, keeping it"
+    SECRET=$(grep -oP '= "\K[0-9a-f]{32}' "$INSTALL_DIR/config.toml" | head -1 || echo "")
+    TLS_DOMAIN=$(grep -oP 'tls_domain\s*=\s*"\K[^"]+' "$INSTALL_DIR/config.toml" || echo "google.com")
+fi
+
+# ── Create service user ─────────────────────────────────────
+if ! id -u mtproto &>/dev/null; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin mtproto
+    ok "Created system user 'mtproto'"
+fi
+chown -R mtproto:mtproto "$INSTALL_DIR"
+
+# ── Install systemd service ─────────────────────────────────
+cp "$TMPBUILD/deploy/mtproto-proxy.service" /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable "$SERVICE_NAME"
+systemctl restart "$SERVICE_NAME"
+ok "Systemd service installed and started"
+
+# ── Firewall ────────────────────────────────────────────────
+if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
+    ufw allow 443/tcp >/dev/null 2>&1
+    ok "Opened port 443 in ufw"
+fi
+
+# ── Cleanup ─────────────────────────────────────────────────
+rm -rf "$TMPBUILD"
+
+# ── Print connection info ───────────────────────────────────
+PUBLIC_IP=$(curl -s --max-time 5 https://ifconfig.me || echo "<SERVER_IP>")
+PORT=$(grep -oP 'port\s*=\s*\K[0-9]+' "$INSTALL_DIR/config.toml" || echo "443")
+
+# Build ee-secret: ee + hex(secret) + hex(tls_domain)
+DOMAIN_HEX=$(echo -n "$TLS_DOMAIN" | xxd -p | tr -d '\n')
+EE_SECRET="ee${SECRET}${DOMAIN_HEX}"
+
+echo ""
+echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════${RESET}"
+echo -e "${BOLD}  MTProto Proxy installed successfully!${RESET}"
+echo -e "${CYAN}══════════════════════════════════════════════════${RESET}"
+echo ""
+echo -e "  ${DIM}Status:${RESET}  systemctl status $SERVICE_NAME"
+echo -e "  ${DIM}Logs:${RESET}    journalctl -u $SERVICE_NAME -f"
+echo -e "  ${DIM}Config:${RESET}  $INSTALL_DIR/config.toml"
+echo ""
+echo -e "  ${BOLD}Connection link:${RESET}"
+echo -e "  ${CYAN}tg://proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${GREEN}${EE_SECRET}${RESET}"
+echo ""
+echo -e "  ${DIM}t.me/proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${EE_SECRET}${RESET}"
+echo ""

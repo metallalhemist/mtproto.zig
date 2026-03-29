@@ -16,6 +16,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 [Features](#-features) &nbsp;&bull;&nbsp;
 [How It Works](#-how-it-works) &nbsp;&bull;&nbsp;
 [Quick Start](#-quick-start) &nbsp;&bull;&nbsp;
+[Deploy](#-deploy-to-server) &nbsp;&bull;&nbsp;
 [Configuration](#-configuration) &nbsp;&bull;&nbsp;
 [Security](#-security) &nbsp;&bull;&nbsp;
 [Project Structure](#-project-structure)
@@ -61,20 +62,21 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 
 - [Zig](https://ziglang.org/download/) **0.15.2** or later
 
-### Build & Run
+### Build & Run locally
 
 ```bash
+# Clone
+git clone https://github.com/sleep3r/mtproto.zig.git
+cd mtproto.zig
+
 # Build (debug)
 zig build
 
-# Build (optimized)
+# Build (optimized for production)
 make release
 
 # Run with default config.toml
-zig build run
-
-# Run with a specific config
-zig build run -- /path/to/config.toml
+make run
 ```
 
 ### Run Tests
@@ -96,6 +98,133 @@ zig build test
 | `make fmt` | Format all Zig source files |
 
 </details>
+
+## &nbsp; Deploy to Server
+
+### One-line install (Ubuntu/Debian)
+
+```bash
+curl -sSf https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/install.sh | sudo bash
+```
+
+This will:
+1. Install **Zig 0.15.2** (if not present)
+2. Clone and build the proxy with `ReleaseFast`
+3. Generate a random 16-byte secret
+4. Create a `systemd` service (`mtproto-proxy`)
+5. Open port 443 in `ufw` (if active)
+6. Print a ready-to-use `tg://` connection link
+
+### Manual deploy
+
+<details>
+<summary>Step-by-step instructions</summary>
+
+**1. Install Zig on the server**
+
+```bash
+# x86_64
+curl -sSfL https://ziglang.org/download/0.15.2/zig-linux-x86_64-0.15.2.tar.xz | \
+  sudo tar xJ -C /usr/local
+sudo ln -sf /usr/local/zig-linux-x86_64-0.15.2/zig /usr/local/bin/zig
+
+# Verify
+zig version   # → 0.15.2
+```
+
+**2. Build the proxy**
+
+```bash
+git clone https://github.com/sleep3r/mtproto.zig.git
+cd mtproto.zig
+zig build -Doptimize=ReleaseFast
+```
+
+Or cross-compile on your Mac:
+
+```bash
+zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
+scp zig-out/bin/mtproto-proxy root@<SERVER_IP>:/opt/mtproto-proxy/
+```
+
+**3. Configure**
+
+```bash
+sudo mkdir -p /opt/mtproto-proxy
+sudo cp zig-out/bin/mtproto-proxy /opt/mtproto-proxy/
+
+# Generate a random secret
+SECRET=$(openssl rand -hex 16)
+echo $SECRET
+
+sudo tee /opt/mtproto-proxy/config.toml <<EOF
+[server]
+port = 443
+
+[censorship]
+tls_domain = "google.com"
+mask = true
+
+[access.users]
+user = "$SECRET"
+EOF
+```
+
+**4. Install the systemd service**
+
+```bash
+sudo cp deploy/mtproto-proxy.service /etc/systemd/system/
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin mtproto
+sudo chown -R mtproto:mtproto /opt/mtproto-proxy
+
+sudo systemctl daemon-reload
+sudo systemctl enable mtproto-proxy
+sudo systemctl start mtproto-proxy
+```
+
+**5. Open port 443**
+
+```bash
+sudo ufw allow 443/tcp
+```
+
+**6. Generate connection link**
+
+The proxy prints links on startup. Check them with:
+
+```bash
+journalctl -u mtproto-proxy | head -30
+```
+
+Or build it manually:
+
+```
+tg://proxy?server=<SERVER_IP>&port=443&secret=ee<SECRET><HEX_DOMAIN>
+```
+
+Where `<HEX_DOMAIN>` is your `tls_domain` encoded as hex:
+
+```bash
+echo -n "google.com" | xxd -p     # → 676f6f676c652e636f6d
+```
+
+</details>
+
+### Managing the service
+
+```bash
+# Status
+sudo systemctl status mtproto-proxy
+
+# Live logs
+sudo journalctl -u mtproto-proxy -f
+
+# Restart (e.g., after config change)
+sudo systemctl restart mtproto-proxy
+
+# Stop
+sudo systemctl stop mtproto-proxy
+```
 
 ## &nbsp; Configuration
 
@@ -126,6 +255,8 @@ bob   = "ffeeddccbbaa99887766554433221100"
 
 </details>
 
+> **Tip** &nbsp; Generate a random secret: `openssl rand -hex 16`
+
 > **Note** &nbsp; The configuration format is compatible with the Rust-based `telemt` proxy.
 
 ## &nbsp; Security
@@ -138,24 +269,29 @@ bob   = "ffeeddccbbaa99887766554433221100"
 | Anti-replay | Embedded timestamp validation rejects handshakes outside +/- 2 min window |
 | Nonce validation | Rejects nonces matching HTTP, plain MTProto, or TLS patterns |
 | Dynamic Record Sizing | TLS record sizes mimic real browsers, preventing traffic fingerprinting |
+| Systemd hardening | Runs as unprivileged user with `NoNewPrivileges`, `ProtectSystem=strict` |
 
 ## &nbsp; Project Structure
 
 ```
-src/
-├── main.zig                  Entry point, allocator setup, config loading
-├── config.zig                TOML-like configuration parser
+├── deploy/
+│   ├── install.sh                One-line installer for Linux
+│   └── mtproto-proxy.service     Systemd unit file
 │
-├── crypto/
-│   └── crypto.zig            AES-256-CTR/CBC, SHA-256, HMAC, SHA-1, MD5
-│
-├── protocol/
-│   ├── constants.zig         DC addresses, protocol tags, TLS constants
-│   ├── tls.zig               Fake TLS 1.3 (ClientHello validation, ServerHello)
-│   └── obfuscation.zig       MTProto v2 obfuscation & key derivation
-│
-└── proxy/
-    └── proxy.zig             TCP listener, connection handler, relay, DRS
+└── src/
+    ├── main.zig                  Entry point, banner, IP detection
+    ├── config.zig                TOML-like configuration parser
+    │
+    ├── crypto/
+    │   └── crypto.zig            AES-256-CTR/CBC, SHA-256, HMAC, SHA-1, MD5
+    │
+    ├── protocol/
+    │   ├── constants.zig         DC addresses, protocol tags, TLS constants
+    │   ├── tls.zig               Fake TLS 1.3 (ClientHello validation, ServerHello)
+    │   └── obfuscation.zig       MTProto v2 obfuscation & key derivation
+    │
+    └── proxy/
+        └── proxy.zig             TCP listener, connection handler, relay, DRS
 ```
 
 ## &nbsp; License

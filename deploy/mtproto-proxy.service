@@ -1,0 +1,31 @@
+[Unit]
+Description=MTProto Proxy (Zig)
+Documentation=https://github.com/sleep3r/mtproto.zig
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mtproto
+Group=mtproto
+WorkingDirectory=/opt/mtproto-proxy
+ExecStart=/opt/mtproto-proxy/mtproto-proxy /opt/mtproto-proxy/config.toml
+Restart=always
+RestartSec=3
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/opt/mtproto-proxy
+
+# Allow binding to privileged ports (443)
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Limits
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
