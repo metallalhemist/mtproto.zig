@@ -38,6 +38,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **Anti-replay** | Timestamp Validation | Rejects replayed handshakes outside a +/- 2 min window |
 | **Masking** | Connection Cloaking | Forwards unauthenticated clients to a real domain |
 | **Fast Mode** | Zero-copy S2C | Drastically reduces CPU usage by delegating Server-to-Client AES encryption to the DC |
+| **Promotion** | Tag Support | Optional promotion tag for sponsored proxy channel registration |
 | **0 deps** | Stdlib Only | Built entirely on the Zig standard library |
 | **0 globals** | Thread Safety | Dependency injection -- no global mutable state |
 
@@ -109,7 +110,7 @@ git clone https://github.com/sleep3r/mtproto.zig.git
 cd mtproto.zig
 
 # Build (debug)
-zig build
+make build
 
 # Build (optimized for production)
 make release
@@ -121,7 +122,7 @@ make run
 ### Run Tests
 
 ```bash
-zig build test
+make test
 ```
 
 <details>
@@ -201,6 +202,7 @@ echo $SECRET
 sudo tee /opt/mtproto-proxy/config.toml <<EOF
 [server]
 port = 443
+# tag = "<your-promotion-tag>"   # Optional: 32 hex-char promotion tag from @MTProxybot
 
 [censorship]
 tls_domain = "wb.ru"
@@ -275,6 +277,7 @@ Create a `config.toml` in the project root:
 ```toml
 [server]
 port = 443
+tag = "1234567890abcdef1234567890abcdef"   # Optional: promotion tag from @MTProxybot
 
 [censorship]
 tls_domain = "wb.ru"
@@ -292,6 +295,7 @@ bob   = "ffeeddccbbaa99887766554433221100"
 | Section | Key | Default | Description |
 |---------|-----|---------|-------------|
 | `[server]` | `port` | `443` | TCP port to listen on |
+| `[server]` | `tag` | _(none)_ | Optional 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
 | `[censorship]` | `tls_domain` | `"wb.ru"` | Domain to impersonate / forward bad clients to |
 | `[censorship]` | `mask` | `true` | Forward unauthenticated connections to `tls_domain` to defeat DPI |
 | `[censorship]` | `fast_mode` | `false` | **Recommended**. Drastically reduces RAM/CPU usage by natively delegating S2C AES encryption to the Telegram DC |

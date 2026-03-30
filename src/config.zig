@@ -9,6 +9,7 @@ pub const Config = struct {
     pub const UserSecret = struct { name: []const u8, secret: [16]u8 };
 
     port: u16 = 443,
+    tag: ?[16]u8 = null,
     tls_domain: []const u8 = "google.com",
     users: std.StringHashMap([16]u8),
     /// Whether to mask bad clients (forward to tls_domain)
@@ -72,6 +73,13 @@ pub const Config = struct {
                 } else if (in_server_section) {
                     if (std.mem.eql(u8, key, "port")) {
                         cfg.port = std.fmt.parseInt(u16, value, 10) catch 443;
+                    } else if (std.mem.eql(u8, key, "tag")) {
+                        if (value.len == 32) {
+                            var tag: [16]u8 = undefined;
+                            if (std.fmt.hexToBytes(&tag, value)) |_| {
+                                cfg.tag = tag;
+                            } else |_| {}
+                        }
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
                         cfg.fast_mode = std.mem.eql(u8, value, "true");
                     }
@@ -207,4 +215,52 @@ test "parse config - getUserSecrets" {
 
     try std.testing.expectEqual(@as(usize, 1), secrets.len);
     try std.testing.expectEqualStrings("alice", secrets[0].name);
+}
+
+test "parse config - tag parsing" {
+    const content =
+        \\[server]
+        \\port = 443
+        \\tag = 1234567890abcdef1234567890abcdef
+        \\
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.tag != null);
+    const expected_tag = [_]u8{ 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef };
+    try std.testing.expectEqual(expected_tag, cfg.tag.?);
+}
+
+test "parse config - tag default null" {
+    const content =
+        \\[server]
+        \\port = 443
+        \\
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.tag == null);
+}
+
+test "parse config - invalid tag ignored" {
+    const content =
+        \\[server]
+        \\tag = tooshort
+        \\
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.tag == null);
 }

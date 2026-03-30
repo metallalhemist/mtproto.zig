@@ -10,7 +10,8 @@ High-performance MTProto proxy that mimics TLS 1.3 handshakes (domain fronting) 
 - **Mac Telegram Desktop**: Fully working, MB-scale traffic, images loading.
 - **iPhone Telegram**: Fully functional. `FAST_MODE` implemented, tested natively, and recommended by default to eliminate S2C encryption overhead.
 - **Stability**: Service previously degraded to 99% CPU within 2 days. Root cause (logging mutexes) found and fixed. Tests prove zero memory leaks.
-- **Test Coverage**: 31/31 tests passing, including fully simulated Black-Box E2E tests for DPI active-probing defense and FakeTLS validation workflows. Target: weeks of stable operation.
+- **Test Coverage**: 34/34 tests passing, including fully simulated Black-Box E2E tests for DPI active-probing defense and FakeTLS validation workflows. Target: weeks of stable operation.
+- **Promotion Tag**: Supported. Sends `proxy_ans_tag` (RPC `0xaeaf0c42`) after DC handshake for sponsored channel registration.
 
 ---
 
@@ -19,7 +20,7 @@ High-performance MTProto proxy that mimics TLS 1.3 handshakes (domain fronting) 
 - **Networking**: `std.net` for TCP, `std.posix` for `poll()`-based I/O
 - **Cryptography**: `std.crypto` for SHA256, HMAC, AES-256-CTR
 - **Build System**: Zig Build System (`build.zig`)
-- **Deployment**: `systemd` service on Linux VPS (Vultr), cross-compiled from macOS
+- **Deployment**: `systemd` service on Linux VPS, cross-compiled from macOS
 
 ---
 
@@ -46,6 +47,7 @@ src/
 3. Client sends `CCS` + 64-byte MTProto obfuscation handshake (in TLS `AppData`).
 4. Proxy derives AES-CTR keys, connects to Telegram DC.
 5. Proxy sends 64-byte nonce to DC.
+5b. (Optional) Proxy sends promotion tag RPC (`0xaeaf0c42` + 16-byte tag) to DC.
 6. **Bidirectional relay**: Client ↔ Proxy ↔ DC
    - **C2S**: TLS unwrap → AES-CTR decrypt(client) → AES-CTR encrypt(DC) → DC
    - **S2C**: DC → AES-CTR decrypt(DC) → AES-CTR encrypt(client) → TLS wrap → Client
@@ -66,12 +68,16 @@ src/
 
 ### Key Commands
 ```bash
-zig build                                              # Debug build (native)
-zig build -Doptimize=ReleaseFast                       # Release build (native)
-zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux # Cross-compile for Linux
-zig build test                                         # Run unit tests
+make build                                             # Debug build (native)
+make release                                           # Release build (native)
+make release_linux                                     # Cross-compile for Linux
+make test                                              # Run unit tests
 make deploy                                            # Cross-compile + stop + scp + start
 ```
+
+> [!NOTE]
+> On macOS 26 (Tahoe), `zig build` is broken due to Zig 0.15.2's linker not supporting the new TBD format.
+> The Makefile works around this by using `zig build-exe`/`zig test` with `--sysroot` pointing to the macOS 15 SDK from Command Line Tools.
 
 ### Deployment
 `make deploy` performs the following steps:
@@ -87,13 +93,15 @@ make deploy                                            # Cross-compile + stop + 
 ```toml
 [server]
 port = 443
+tag = "1234567890abcdef1234567890abcdef"   # Optional: promotion tag from @MTProxybot
 
 [censorship]
 tls_domain = "wb.ru"
 mask = true
+fast_mode = true
 
 [access.users]
-alexander = "0b513f6e83524354984a8835939fa9af"
+alexander = "00112233445566778899aabbccddeeff"
 ```
 
 ### Systemd Unit (`deploy/mtproto-proxy.service`)
@@ -231,6 +239,7 @@ All relay sockets use these settings:
 14. DRS frozen at 1369 bytes for compatibility.
 15. TLS Alert logging added.
 16. **Hairpin routing fix**: AmneziaVPN (Docker/WireGuard) on the same server blocked iOS VPN clients from reaching port 443 due to Docker's `FORWARD policy DROP`. Fixed with `iptables -I DOCKER-USER -s 172.29.172.0/24 -p tcp --dport 443 -j ACCEPT`.
+17. **Promotion tag**: Added `tag` config field and `proxy_ans_tag` RPC (`0xaeaf0c42`) sent to DC after handshake. Supports abridged, intermediate, and secure framing.
 
 ---
 
@@ -277,32 +286,32 @@ netfilter-persistent save
 ### Service & Process Monitoring
 ```bash
 # Check service status
-ssh root@45.77.223.232 'systemctl status mtproto-proxy --no-pager'
+ssh root@209.131.70.125 'systemctl status mtproto-proxy --no-pager'
 
 # Check active connections
-ssh root@45.77.223.232 'ss -tnp | grep mtproto'
+ssh root@209.131.70.125 'ss -tnp | grep mtproto'
 
 # Check process stats (CPU, threads, memory)
-ssh root@45.77.223.232 'ps -o pid,pcpu,pmem,nlwp,rss,vsz,args -p $(pgrep -f mtproto-proxy)'
+ssh root@209.131.70.125 'ps -o pid,pcpu,pmem,nlwp,rss,vsz,args -p $(pgrep -f mtproto-proxy)'
 ```
 
 ### Log Analysis
 ```bash
 # Check recent logs
-ssh root@45.77.223.232 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager'
+ssh root@209.131.70.125 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager'
 
 # Filter by IP (Mac)
-ssh root@45.77.223.232 'journalctl -u mtproto-proxy --no-pager | grep 81.17.27.66'
+ssh root@209.131.70.125 'journalctl -u mtproto-proxy --no-pager | grep 81.17.27.66'
 
 # Filter by IP (iPhone)
-ssh root@45.77.223.232 'journalctl -u mtproto-proxy --no-pager | grep 109.252.90.134'
+ssh root@209.131.70.125 'journalctl -u mtproto-proxy --no-pager | grep 109.252.90.134'
 ```
 
 ### Low-level Debugging
 ```bash
 # Check for CLOSE-WAIT sockets
-ssh root@45.77.223.232 'ss -tnp state close-wait | grep mtproto'
+ssh root@209.131.70.125 'ss -tnp state close-wait | grep mtproto'
 
 # Check thread states in Linux /proc
-ssh root@45.77.223.232 'cat /proc/$(pgrep -f mtproto-proxy)/status | grep -E "Threads|State"'
+ssh root@209.131.70.125 'cat /proc/$(pgrep -f mtproto-proxy)/status | grep -E "Threads|State"'
 ```
