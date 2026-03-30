@@ -46,14 +46,14 @@ else
         *)       fail "Unsupported architecture: $ARCH" ;;
     esac
 
-    ZIG_TAR="zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
+    ZIG_TAR="zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"
     ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TAR}"
 
     cd /tmp
     curl -sSfL -o "$ZIG_TAR" "$ZIG_URL"
     tar xf "$ZIG_TAR"
     rm -rf /usr/local/zig
-    mv "zig-linux-${ZIG_ARCH}-${ZIG_VERSION}" /usr/local/zig
+    mv "zig-${ZIG_ARCH}-linux-${ZIG_VERSION}" /usr/local/zig
     ln -sf /usr/local/zig/zig /usr/local/bin/zig
     rm -f "$ZIG_TAR"
     ok "Zig $ZIG_VERSION installed to /usr/local/zig"
