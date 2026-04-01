@@ -34,3 +34,20 @@ deploy:
 		rm .env.tmp_deploy; \
 	fi
 	ssh root@$(SERVER) 'systemctl start mtproto-proxy && systemctl status mtproto-proxy --no-pager'
+
+migrate:
+	@if [ -z "$(SERVER)" ]; then echo "Usage: make migrate SERVER=<ip> [PASSWORD=<pass>]"; exit 1; fi
+	@echo "--- 1. Setting up SSH key ---"
+	@if [ -n "$(PASSWORD)" ]; then \
+		PUBKEY=$$(cat ~/.ssh/id_rsa.pub 2>/dev/null || cat ~/.ssh/id_ed25519.pub 2>/dev/null); \
+		if [ -n "$$PUBKEY" ]; then \
+			sshpass -p '$(PASSWORD)' ssh -o StrictHostKeyChecking=no root@$(SERVER) "mkdir -p ~/.ssh && echo \"$$PUBKEY\" >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && chmod 700 ~/.ssh" || true; \
+		fi; \
+	fi
+	@echo "--- 2. Running bootstrap install script ---"
+	ssh -o StrictHostKeyChecking=no root@$(SERVER) 'bash -s' < deploy/install.sh
+	@echo "--- 3. Pushing local configuration ---"
+	scp config.toml root@$(SERVER):/opt/mtproto-proxy/
+	@echo "--- 4. Deploying binary & restarting ---"
+	$(MAKE) deploy SERVER=$(SERVER)
+	@echo "--- MIGRATION COMPLETE ---"
