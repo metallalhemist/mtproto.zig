@@ -5,3 +5,4 @@ telemt/
 .DS_Store
 VALIDATION.md
 config.toml
+.env

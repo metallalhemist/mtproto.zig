@@ -330,7 +330,7 @@ fn handleConnectionInner(
     @memcpy(client_hello_buf[0..5], &first_bytes);
     const body_n = try readExact(client_stream, client_hello_buf[5..][0..record_len]);
     if (body_n < record_len) {
-        log.debug("[{d}] ({s}) Short read on ClientHello body (got {d}, expected {d}), dropping.", .{ conn_id, peer_str, body_n, record_len });
+        log.info("[{d}] ({s}) DIAG: Short read on ClientHello body (got {d}, expected {d}), dropping.", .{ conn_id, peer_str, body_n, record_len });
         maskConnection(state, client_stream, peer_str, conn_id, client_hello_buf[0 .. 5 + body_n], null);
         return;
     }
@@ -1029,10 +1029,21 @@ fn writeAll(stream: net.Stream, data: []const u8) !void {
 }
 
 /// Read exactly `buf.len` bytes, returning how many were read.
+/// On WouldBlock, retries via poll(). On hard errors or EOF, returns what was read so far.
 fn readExact(stream: net.Stream, buf: []u8) !usize {
     var total: usize = 0;
     while (total < buf.len) {
         const nr = stream.read(buf[total..]) catch |err| {
+            if (err == error.WouldBlock) {
+                // Socket is non-blocking and no data ready yet — poll and retry.
+                var poll_fds = [_]posix.pollfd{
+                    .{ .fd = stream.handle, .events = posix.POLL.IN, .revents = 0 },
+                };
+                const ready = posix.poll(&poll_fds, 30_000) catch return total;
+                if (ready == 0) return total; // timeout
+                if (poll_fds[0].revents & (posix.POLL.ERR | posix.POLL.HUP) != 0) return total;
+                continue; // retry read
+            }
             if (total > 0) return total;
             return err;
         };

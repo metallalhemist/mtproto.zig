@@ -72,6 +72,9 @@ ok "Build complete"
 # ── Install binary ──────────────────────────────────────────
 info "Installing to $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR"
+if systemctl is-active --quiet "$SERVICE_NAME"; then
+    systemctl stop "$SERVICE_NAME"
+fi
 cp zig-out/bin/mtproto-proxy "$INSTALL_DIR/mtproto-proxy"
 chmod +x "$INSTALL_DIR/mtproto-proxy"
 
@@ -115,10 +118,23 @@ systemctl enable "$SERVICE_NAME"
 systemctl restart "$SERVICE_NAME"
 ok "Systemd service installed and started"
 
-# ── Firewall ────────────────────────────────────────────────
+# ── Firewall & DPI bypass ───────────────────────────────────
+apt-get install -y iptables >/dev/null 2>&1 || true
+
 if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
     ufw allow 443/tcp >/dev/null 2>&1
     ok "Opened port 443 in ufw"
+fi
+
+# TCPMSS clamping: force ClientHello fragmentation to bypass passive DPI
+if command -v iptables &>/dev/null; then
+    iptables -t mangle -D OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null || true
+    iptables -t mangle -A OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88
+    mkdir -p /etc/iptables
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    ok "TCPMSS=88 clamping applied (passive DPI bypass)"
+else
+    echo -e "${RED}⚠${RESET} iptables not found — TCPMSS bypass NOT applied"
 fi
 
 # ── Cleanup ─────────────────────────────────────────────────
