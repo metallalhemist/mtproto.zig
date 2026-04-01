@@ -132,9 +132,17 @@ if command -v iptables &>/dev/null; then
     iptables -t mangle -A OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88
     mkdir -p /etc/iptables
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-    ok "TCPMSS=88 clamping applied (passive DPI bypass)"
+    ok "TCPMSS=88 clamping applied to IPv4 (passive DPI bypass)"
 else
-    echo -e "${RED}⚠${RESET} iptables not found — TCPMSS bypass NOT applied"
+    echo -e "${RED}⚠${RESET} iptables not found — IPv4 TCPMSS bypass NOT applied"
+fi
+
+if command -v ip6tables &>/dev/null; then
+    ip6tables -t mangle -D OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null || true
+    ip6tables -t mangle -A OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88
+    mkdir -p /etc/iptables
+    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+    ok "TCPMSS=88 clamping applied to IPv6 (passive DPI bypass)"
 fi
 
 # ── IPv6 Hopping (Cloudflare API) ───────────────────────────
