@@ -37,6 +37,10 @@ fail()  { echo -e "${RED}✗${RESET} $*" >&2; exit 1; }
 # ── Check root ──────────────────────────────────────────────
 [[ $EUID -eq 0 ]] || fail "Run as root: sudo bash install.sh"
 
+# ── Packages & Dependencies ──────────────────────────────────
+apt-get update -qq || true
+apt-get install -y iptables xxd git curl openssl tar xz-utils >/dev/null 2>&1 || true
+
 # ── Install Zig ─────────────────────────────────────────────
 if command -v zig &>/dev/null && zig version 2>/dev/null | grep -q "$ZIG_VERSION"; then
     ok "Zig $ZIG_VERSION already installed"
@@ -120,8 +124,6 @@ systemctl restart "$SERVICE_NAME"
 ok "Systemd service installed and started"
 
 # ── Firewall & DPI bypass ───────────────────────────────────
-apt-get install -y iptables >/dev/null 2>&1 || true
-
 if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
     ufw allow 443/tcp >/dev/null 2>&1
     ok "Opened port 443 in ufw"
