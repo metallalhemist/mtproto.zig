@@ -31,6 +31,7 @@ RESET='\033[0m'
 
 info()  { echo -e "${CYAN}▸${RESET} $*"; }
 ok()    { echo -e "${GREEN}✓${RESET} $*"; }
+warn()  { echo -e "${RED}⚠${RESET} $*"; }
 fail()  { echo -e "${RED}✗${RESET} $*" >&2; exit 1; }
 
 # ── Check root ──────────────────────────────────────────────

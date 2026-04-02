@@ -83,7 +83,7 @@ fi
 
 # ── Install dependencies ────────────────────────────────────
 info "Installing build dependencies..."
-apt-get update -qq
+apt-get update -qq || true
 apt-get install -y build-essential git libnetfilter-queue-dev \
     libcap-dev iptables libmnl-dev zlib1g-dev >/dev/null 2>&1
 ok "Dependencies installed"

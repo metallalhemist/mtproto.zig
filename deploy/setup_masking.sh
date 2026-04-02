@@ -51,7 +51,7 @@ if command -v nginx &>/dev/null; then
     ok "Nginx already installed"
 else
     info "Installing Nginx..."
-    apt-get update -qq
+    apt-get update -qq || true
     apt-get install -y nginx >/dev/null 2>&1
     ok "Nginx installed"
 fi
