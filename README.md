@@ -19,6 +19,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 
 [Features](#-features) &nbsp;&bull;&nbsp;
 [Quick Start](#-quick-start) &nbsp;&bull;&nbsp;
+[Releases](#-releases) &nbsp;&bull;&nbsp;
 [Deploy](#-deploy-to-server) &nbsp;&bull;&nbsp;
 [Configuration](#-configuration) &nbsp;&bull;&nbsp;
 [Troubleshooting](#-troubleshooting-updating)
@@ -91,8 +92,35 @@ make test
 | `make fmt` | Format all Zig source files |
 | `make deploy` | Cross-compile, upload binary/scripts/config to VPS, restart service |
 | `make deploy SERVER=<ip>` | Deploy to a specific server |
+| `make release-manual VERSION=vX.Y.Z` | Manual fallback: tag HEAD and publish GitHub Release |
 
 </details>
+
+## &nbsp; Releases
+
+Automated releases are managed by GitHub Actions and `release-please`.
+
+### Recommended flow (automatic)
+
+1. Merge commits into `main` using Conventional Commit prefixes.
+2. `Release Please` opens or updates a release PR when a version bump is needed.
+3. Merge that release PR to create tag `vX.Y.Z`, update `CHANGELOG.md`, and publish a GitHub release.
+4. `Release Assets` builds Linux binaries and attaches `.tar.gz` artifacts to the published release.
+
+Version bump rules:
+- `fix:` -> patch (`v1.2.3` -> `v1.2.4`)
+- `feat:` -> minor (`v1.2.3` -> `v1.3.0`)
+- `feat!:` or `BREAKING CHANGE:` -> major (`v1.2.3` -> `v2.0.0`)
+
+### Manual fallback from CLI
+
+If GitHub automation is unavailable, you can publish a release directly from your terminal:
+
+```bash
+make release-manual VERSION=v1.2.3
+```
+
+This tags current `HEAD`, pushes the tag, and creates a GitHub release with generated notes.
 
 ## &nbsp; Deploy to Server
 

@@ -1,4 +1,4 @@
-.PHONY: build release run test clean fmt deploy migrate update-dns
+.PHONY: build release run test clean fmt deploy migrate update-dns release-manual
 
 SERVER ?= 185.125.46.60
 CONFIG ?= config.toml
@@ -8,6 +8,19 @@ build:
 
 release:
 	zig build -Doptimize=ReleaseFast
+
+release-manual:
+	@if [ -z "$(VERSION)" ]; then \
+		echo "Usage: make release-manual VERSION=v1.2.3"; \
+		exit 1; \
+	fi
+	@if git rev-parse "$(VERSION)" >/dev/null 2>&1; then \
+		echo "Tag $(VERSION) already exists"; \
+		exit 1; \
+	fi
+	git tag "$(VERSION)"
+	git push origin "$(VERSION)"
+	gh release create "$(VERSION)" --title "$(VERSION)" --generate-notes
 
 run:
 	zig build run -- $(CONFIG)
