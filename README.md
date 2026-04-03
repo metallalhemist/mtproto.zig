@@ -20,6 +20,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 [Features](#-features) &nbsp;&bull;&nbsp;
 [Quick Start](#-quick-start) &nbsp;&bull;&nbsp;
 [Update](#-update-existing-server) &nbsp;&bull;&nbsp;
+[Docker](#docker-image) &nbsp;&bull;&nbsp;
 [Deploy](#-deploy-to-server) &nbsp;&bull;&nbsp;
 [Configuration](#-configuration) &nbsp;&bull;&nbsp;
 [Troubleshooting](#-troubleshooting-updating)
@@ -147,6 +148,74 @@ Or pinned version:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/update.sh | sudo bash -s -- v0.1.0
 ```
+
+## Docker image
+
+The repository includes a **multi-stage Dockerfile**: Zig is bootstrapped from the official tarball inside the build stage; the runtime image is Debian **bookworm-slim** with `curl` and CA certs (startup banner resolves the public IP via `curl`). The process runs as **root** inside the container (simple bind to port 443). The image ships `config.toml.example` as `/etc/mtproto-proxy/config.toml` for a quick start; mount your own file for real secrets and settings.
+
+### Build
+
+```bash
+docker build -t mtproto-zig .
+```
+
+### Build arguments
+
+| Argument       | Default   | Description |
+|----------------|-----------|-------------|
+| `ZIG_VERSION`  | `0.15.2`  | Version string passed to `ziglang.org/download/…/zig-<arch>-linux-<version>.tar.xz`. Must match a published Zig release. |
+| `ZIG_SHA256`   | _(empty)_ | Optional pinned SHA256 for the downloaded Zig tarball. If set, Docker build verifies integrity before extraction. |
+
+Example:
+
+```bash
+docker build --build-arg ZIG_VERSION=0.15.2 -t mtproto-zig .
+```
+
+### Architecture (`TARGETARCH`)
+
+The **builder** stage maps Docker’s auto-injected `TARGETARCH` to Zig’s Linux tarball name:
+
+| `TARGETARCH` (BuildKit) | Zig tarball |
+|-------------------------|-------------|
+| `amd64`                 | `x86_64`    |
+| `arm64`                 | `aarch64`   |
+
+You normally **do not** pass `TARGETARCH` yourself; BuildKit sets it from the requested platform.  
+If BuildKit auto-args are unavailable, the Dockerfile falls back to host architecture detection.
+
+**Build for a specific CPU architecture** (e.g. from an Apple Silicon Mac to run on an `amd64` VPS):
+
+```bash
+docker build --platform linux/amd64 -t mtproto-zig:amd64 .
+docker build --platform linux/arm64 -t mtproto-zig:arm64 .
+```
+
+**Multi-platform image** (push requires a registry and `buildx`):
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t your-registry/mtproto-zig:latest \
+  --push .
+```
+
+### Run
+
+Publish the listen port from your config (the bundled example listens on `443`). For production, mount your `config.toml` over the default:
+
+```bash
+docker run --rm \
+  -p 443:443 \
+  -v "$PWD/config.toml:/etc/mtproto-proxy/config.toml:ro" \
+  mtproto-zig
+```
+
+`docker run --rm -p 443:443 mtproto-zig` also works using the in-image example config (replace example user secrets before exposing the service).
+
+If your config sets `server.port = 8443`, publish `-p 8443:8443` instead.
+
+OS-level mitigations from `deploy/` (iptables `TCPMSS`, `nfqws`, etc.) are **not** applied inside the container; only the proxy binary runs there.
 
 ## &nbsp; Deploy to Server
 
