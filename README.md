@@ -11,7 +11,6 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Zig](https://img.shields.io/badge/zig-0.15.2-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
 [![Platform](https://img.shields.io/badge/platform-linux-blueviolet.svg?logo=linux&logoColor=white)](#install)
-[![LOC](https://img.shields.io/badge/lines_of_code-5.5k-informational)](src/)
 
 </div>
 
@@ -206,6 +205,8 @@ sudo mtbuddy setup tunnel /path/to/awg0.conf --mode direct
 
 After setup, `mtbuddy` validates connectivity to all 5 Telegram DCs through the tunnel and prints the link.
 
+It also sets `[upstream].type = "amnezia_wg"` in `config.toml`, so tunnel intent is explicit in config (not only in systemd/netns wiring).
+
 ---
 
 ## Configuration
@@ -216,9 +217,12 @@ Config lives at `/opt/mtproto-proxy/config.toml`. MTBuddy generates it on instal
 [general]
 use_middle_proxy = true   # ME mode for promo-channel parity
 
+[upstream]
+type = "auto"            # auto | direct | amnezia_wg
+
 [server]
 port = 443
-# public_ip = "proxy.example.com"   # Override auto-detected IP (required with tunnel)
+# public_ip = "proxy.example.com"   # Override auto-detected IP (recommended with amnezia_wg)
 max_connections = 512
 idle_timeout_sec = 120
 handshake_timeout_sec = 15
@@ -246,6 +250,7 @@ alice = true   # bypass MiddleProxy for this user
 
 | Key | Default | Description |
 |-----|---------|-------------|
+| `[upstream] type` | `auto` | Egress mode: `auto` (detect netns), `direct`, or `amnezia_wg` (requires proxy in tunnel netns) |
 | `[general] use_middle_proxy` | `false` | Telemt-compatible ME mode for DC1..5 (recommended for promo parity) |
 | `[general] ad_tag` | — | Alias for `[server].tag` (telemt compat) |
 | `[server] port` | `443` | TCP listen port |
@@ -269,6 +274,8 @@ alice = true   # bypass MiddleProxy for this user
 | `[censorship] fast_mode` | `false` | Delegate S2C encryption to DC (recommended) |
 | `[access.users] <name>` | — | 32 hex-char secret per user |
 | `[access.direct_users] <name>` | — | Bypass ME for this user |
+
+[tunnel].type is deprecated and kept only for backward compatibility; use `[upstream].type`.
 
 </details>
 

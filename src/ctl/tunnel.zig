@@ -9,6 +9,7 @@ const tui_mod = @import("tui.zig");
 const i18n = @import("i18n.zig");
 const sys = @import("sys.zig");
 const toml = @import("toml.zig");
+const Tunnel = @import("tunnel").Tunnel;
 
 const Tui = tui_mod.Tui;
 const Color = tui_mod.Color;
@@ -249,6 +250,9 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
     };
     ui.ok(mode_label);
 
+    setUpstreamType(allocator, "amnezia_wg");
+    ui.stepOk("Set [upstream].type", "amnezia_wg");
+
     // ── Inject public IP (preserve existing custom value) ──
     var doc = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch null;
     if (doc) |*d| {
@@ -301,13 +305,20 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
         ui.ok("Nginx masking patched for tunnel netns");
     }
 
-    // ── Firewall: allow namespace → host veth traffic ──
+    // ── Firewall rules for namespace ──
     if (sys.commandExists("ufw")) {
         var ufw_buf: [128]u8 = undefined;
         const ufw_rule = std.fmt.bufPrint(&ufw_buf, "ufw allow from 10.200.200.0/24 to 10.200.200.1 port {s}", .{port}) catch "";
         if (ufw_rule.len > 0) {
             _ = sys.exec(allocator, &.{ "bash", "-c", ufw_rule }) catch {};
             ui.ok("Firewall: allowed namespace traffic to host veth");
+        }
+
+        var route_buf: [128]u8 = undefined;
+        const route_rule = std.fmt.bufPrint(&route_buf, "ufw route allow proto tcp to 10.200.200.2 port {s}", .{port}) catch "";
+        if (route_rule.len > 0) {
+            _ = sys.exec(allocator, &.{ "bash", "-c", route_rule }) catch {};
+            ui.ok("Firewall: allowed external client traffic forwarding");
         }
     }
 
@@ -367,6 +378,16 @@ fn setUseMiddleProxy(allocator: std.mem.Allocator, value: []const u8) void {
     doc.save(INSTALL_DIR ++ "/config.toml") catch {};
 }
 
+fn setUpstreamType(allocator: std.mem.Allocator, value: []const u8) void {
+    var doc = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch return;
+    defer doc.deinit();
+
+    var quoted_buf: [64]u8 = undefined;
+    const quoted = std.fmt.bufPrint(&quoted_buf, "\"{s}\"", .{value}) catch return;
+    doc.set("upstream", "type", quoted) catch return;
+    doc.save(INSTALL_DIR ++ "/config.toml") catch {};
+}
+
 fn stripAwgDnsLines(allocator: std.mem.Allocator, path: []const u8) !bool {
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
@@ -411,4 +432,18 @@ fn stripAwgDnsLines(allocator: std.mem.Allocator, path: []const u8) !bool {
 
     try sys.writeFileMode(path, sanitized, 0o600);
     return true;
+}
+
+/// Detect the currently active tunnel by inspecting runtime state.
+/// Returns the `Tunnel.Tag` corresponding to the detected tunnel,
+/// or `.none` if no known tunnel is active.
+pub fn detectActiveTunnel(allocator: std.mem.Allocator) Tunnel.Tag {
+    // Check if AmneziaWG interface is up inside the network namespace
+    const result = sys.exec(allocator, &.{
+        "ip", "netns", "exec", NS_NAME, "awg", "show", "awg0",
+    }) catch return .none;
+    defer result.deinit();
+
+    if (result.exit_code == 0) return .amnezia_wg;
+    return .none;
 }

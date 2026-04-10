@@ -4,6 +4,62 @@
 //! Format is compatible with the Rust telemt config.toml.
 
 const std = @import("std");
+const Tunnel = @import("tunnel.zig").Tunnel;
+
+pub const UpstreamMode = enum {
+    /// Infer egress mode from runtime environment (default).
+    /// If proxy runs in non-init netns, treat as AmneziaWG; otherwise direct.
+    auto,
+    /// Explicit direct egress.
+    direct,
+    /// Explicit AmneziaWG egress (requires running inside tunnel netns).
+    amnezia_wg,
+};
+
+fn parseUpstreamMode(value: []const u8) ?UpstreamMode {
+    if (std.mem.eql(u8, value, "auto")) return .auto;
+    if (std.mem.eql(u8, value, "direct") or std.mem.eql(u8, value, "none")) return .direct;
+    if (std.mem.eql(u8, value, "amnezia_wg") or std.mem.eql(u8, value, "amneziawg")) return .amnezia_wg;
+    return null;
+}
+
+fn parseLegacyTunnelMode(value: []const u8) UpstreamMode {
+    return switch (Tunnel.fromString(value)) {
+        .none => .direct,
+        .amnezia_wg => .amnezia_wg,
+    };
+}
+
+fn stripInlineComment(value: []const u8) []const u8 {
+    var in_quotes = false;
+    var escaped = false;
+    var i: usize = 0;
+
+    while (i < value.len) : (i += 1) {
+        const ch = value[i];
+
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+
+        if (in_quotes and ch == '\\') {
+            escaped = true;
+            continue;
+        }
+
+        if (ch == '"') {
+            in_quotes = !in_quotes;
+            continue;
+        }
+
+        if (!in_quotes and (ch == '#' or ch == ';')) {
+            return std.mem.trimRight(u8, value[0..i], &[_]u8{ ' ', '\t' });
+        }
+    }
+
+    return std.mem.trimRight(u8, value, &[_]u8{ ' ', '\t' });
+}
 
 pub const Config = struct {
     pub const UserSecret = struct { name: []const u8, secret: [16]u8 };
@@ -63,6 +119,11 @@ pub const Config = struct {
     unsafe_override_limits: bool = false,
     /// Test-only hook to redirect upstream connections locally
     datacenter_override: ?std.net.Address = null,
+    /// Upstream egress mode. Parsed from [upstream].type.
+    /// Supported values: auto | direct | amnezia_wg.
+    upstream_mode: UpstreamMode = .auto,
+    /// Backward-compatibility marker: config used deprecated [tunnel] section.
+    uses_legacy_tunnel_section: bool = false,
 
     pub fn middleProxyBufferBytes(self: *const Config) usize {
         return @as(usize, self.middleproxy_buffer_kb) * 1024;
@@ -106,6 +167,11 @@ pub const Config = struct {
                 }
             }
         }
+
+        if (self.uses_legacy_tunnel_section) {
+            const log = std.log.scoped(.config);
+            log.warn("[tunnel] section is deprecated; use [upstream] type = \"direct|amnezia_wg|auto\"", .{});
+        }
     }
 
     pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
@@ -128,7 +194,10 @@ pub const Config = struct {
         var in_censorship_section = false;
         var in_server_section = false;
         var in_general_section = false;
+        var in_upstream_section = false;
+        var in_tunnel_section = false;
         var server_tag_set = false;
+        var upstream_set = false;
 
         while (lines.next()) |raw_line| {
             const line = std.mem.trim(u8, raw_line, &[_]u8{ ' ', '\t', '\r' });
@@ -143,6 +212,8 @@ pub const Config = struct {
                 in_censorship_section = std.mem.eql(u8, line, "[censorship]");
                 in_server_section = std.mem.eql(u8, line, "[server]");
                 in_general_section = std.mem.eql(u8, line, "[general]");
+                in_upstream_section = std.mem.eql(u8, line, "[upstream]");
+                in_tunnel_section = std.mem.eql(u8, line, "[tunnel]");
                 continue;
             }
 
@@ -150,6 +221,8 @@ pub const Config = struct {
             if (std.mem.indexOfScalar(u8, line, '=')) |eq_pos| {
                 const key = std.mem.trim(u8, line[0..eq_pos], &[_]u8{ ' ', '\t' });
                 var value = std.mem.trim(u8, line[eq_pos + 1 ..], &[_]u8{ ' ', '\t' });
+                value = stripInlineComment(value);
+                if (value.len == 0) continue;
 
                 // Strip quotes from value
                 if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
@@ -247,6 +320,20 @@ pub const Config = struct {
                         cfg.drs = std.mem.eql(u8, value, "true");
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
                         cfg.fast_mode = std.mem.eql(u8, value, "true");
+                    }
+                } else if (in_upstream_section) {
+                    if (std.mem.eql(u8, key, "type")) {
+                        if (parseUpstreamMode(value)) |mode| {
+                            cfg.upstream_mode = mode;
+                            upstream_set = true;
+                        }
+                    }
+                } else if (in_tunnel_section) {
+                    if (std.mem.eql(u8, key, "type")) {
+                        cfg.uses_legacy_tunnel_section = true;
+                        if (!upstream_set) {
+                            cfg.upstream_mode = parseLegacyTunnelMode(value);
+                        }
                     }
                 }
             }
@@ -554,6 +641,36 @@ test "parse config - tag parsing" {
     try std.testing.expectEqual(expected_tag, cfg.tag.?);
 }
 
+test "parse config - inline comment after tag" {
+    const content =
+        \\[server]
+        \\tag = "1234567890abcdef1234567890abcdef" # production tag
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.tag != null);
+    const expected_tag = [_]u8{ 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef };
+    try std.testing.expectEqual(expected_tag, cfg.tag.?);
+}
+
+test "parse config - quoted hash preserved" {
+    const content =
+        \\[censorship]
+        \\tls_domain = "exa#mple.com" # inline comment
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("exa#mple.com", cfg.tls_domain);
+}
+
 test "parse config - tag default null" {
     const content =
         \\[server]
@@ -809,4 +926,90 @@ test "parse config - multiple users" {
     const alice_secret = cfg.users.get("alice").?;
     try std.testing.expectEqual(@as(u8, 0x00), alice_secret[0]);
     try std.testing.expectEqual(@as(u8, 0xff), alice_secret[15]);
+}
+
+test "parse config - upstream type amnezia_wg" {
+    const content =
+        \\[upstream]
+        \\type = "amnezia_wg"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(UpstreamMode.amnezia_wg, cfg.upstream_mode);
+}
+
+test "parse config - upstream type default auto" {
+    const content =
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(UpstreamMode.auto, cfg.upstream_mode);
+}
+
+test "parse config - upstream type direct explicit" {
+    const content =
+        \\[upstream]
+        \\type = "direct"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(UpstreamMode.direct, cfg.upstream_mode);
+}
+
+test "parse config - upstream type invalid keeps default auto" {
+    const content =
+        \\[upstream]
+        \\type = "banana"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(UpstreamMode.auto, cfg.upstream_mode);
+}
+
+test "parse config - legacy tunnel maps to upstream" {
+    const content =
+        \\[tunnel]
+        \\type = "amnezia_wg"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.uses_legacy_tunnel_section);
+    try std.testing.expectEqual(UpstreamMode.amnezia_wg, cfg.upstream_mode);
+}
+
+test "parse config - upstream overrides legacy tunnel" {
+    const content =
+        \\[tunnel]
+        \\type = "amnezia_wg"
+        \\[upstream]
+        \\type = "direct"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.uses_legacy_tunnel_section);
+    try std.testing.expectEqual(UpstreamMode.direct, cfg.upstream_mode);
 }

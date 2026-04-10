@@ -16,11 +16,13 @@ const middleproxy = @import("../protocol/middleproxy.zig");
 const tls = @import("../protocol/tls.zig");
 const Config = @import("../config.zig").Config;
 const upstream_mod = @import("upstream.zig");
+const tunnel_mod = @import("../tunnel.zig");
 
 const log = std.log.scoped(.proxy);
 
 const tls_header_len = 5;
-const event_loop_wait_ms = 37;
+const event_loop_wait_ms: i32 = 37;
+const desync_wait_poll_ms: i32 = 3;
 const accept_backoff_ms: i64 = 500;
 const accept_backoff_ns: i128 = @as(i128, accept_backoff_ms) * std.time.ns_per_ms;
 const accept_batch_limit: usize = 256;
@@ -35,7 +37,8 @@ const tunnel_mask_gateway_ip = "10.200.200.1";
 const min_nofile_soft: usize = 65535;
 const client_hello_inline_size: usize = 512;
 const mp_handshake_frame_buf_size: usize = 2048;
-const read_buf_size: usize = 4096;
+const read_buf_size: usize = 32 * 1024;
+const max_pipelined_handshake_bytes: usize = 128 * 1024;
 
 /// Per-/24 (IPv4) or /48 (IPv6) subnet rate limiter.
 /// Fixed-size open-addressed hash table — zero heap allocation.
@@ -150,46 +153,23 @@ const SubnetRateLimit = struct {
     }
 };
 
-const MsgBlockClass = enum(u2) {
-    tiny = 0,
-    small = 1,
-    standard = 2,
-};
-
 const MsgBlock = struct {
-    class: MsgBlockClass,
     len: usize,
-    data: [standard_block_size]u8,
+    data: [msg_block_size]u8,
 };
 
-const tiny_block_size: usize = 64;
-const small_block_size: usize = 512;
-const standard_block_size: usize = 2048;
+const msg_block_size: usize = 2048;
+const msg_free_cap_per_queue: usize = 4;
 const max_scatter_parts: usize = 64;
+const upstream_candidates_inline_cap: usize = 4;
 
 fn hasFatalEpollHangup(events: u32) bool {
     return (events & (linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP)) != 0;
 }
 
-fn classCapacity(class: MsgBlockClass) usize {
-    return switch (class) {
-        .tiny => tiny_block_size,
-        .small => small_block_size,
-        .standard => standard_block_size,
-    };
-}
-
-fn chooseClass(size: usize) MsgBlockClass {
-    if (size <= tiny_block_size) return .tiny;
-    if (size <= small_block_size) return .small;
-    return .standard;
-}
-
 const MessageQueue = struct {
     allocator: std.mem.Allocator,
-    tiny_free: std.ArrayListUnmanaged(*MsgBlock) = .{},
-    small_free: std.ArrayListUnmanaged(*MsgBlock) = .{},
-    std_free: std.ArrayListUnmanaged(*MsgBlock) = .{},
+    free: std.ArrayListUnmanaged(*MsgBlock) = .{},
     blocks: std.ArrayListUnmanaged(*MsgBlock) = .{},
     head_idx: usize = 0,
     offset: usize = 0,
@@ -198,21 +178,15 @@ const MessageQueue = struct {
     fn deinit(self: *MessageQueue) void {
         self.clear();
 
-        for (self.tiny_free.items) |blk| self.allocator.destroy(blk);
-        for (self.small_free.items) |blk| self.allocator.destroy(blk);
-        for (self.std_free.items) |blk| self.allocator.destroy(blk);
+        for (self.free.items) |blk| self.allocator.destroy(blk);
 
-        self.tiny_free.deinit(self.allocator);
-        self.small_free.deinit(self.allocator);
-        self.std_free.deinit(self.allocator);
+        self.free.deinit(self.allocator);
         self.blocks.deinit(self.allocator);
     }
 
     fn clear(self: *MessageQueue) void {
         for (self.blocks.items[self.head_idx..]) |blk| {
-            self.recycleBlock(blk) catch {
-                self.allocator.destroy(blk);
-            };
+            self.recycleBlock(blk);
         }
         self.blocks.clearRetainingCapacity();
         self.head_idx = 0;
@@ -228,13 +202,26 @@ const MessageQueue = struct {
         if (data.len == 0) return;
 
         var off: usize = 0;
+
+        if (self.blocks.items.len > 0) {
+            const last_blk = self.blocks.items[self.blocks.items.len - 1];
+            if (last_blk.len < msg_block_size) {
+                const space = msg_block_size - last_blk.len;
+                const take = @min(space, data.len);
+                @memcpy(last_blk.data[last_blk.len .. last_blk.len + take], data[off .. off + take]);
+                last_blk.len += take;
+                self.total_len += take;
+                off += take;
+            }
+        }
+
         while (off < data.len) {
             const rem = data.len - off;
-            const class = chooseClass(rem);
-            const cap = classCapacity(class);
-            const take = @min(rem, cap);
+            const take = @min(rem, msg_block_size);
 
-            var blk = try self.acquireBlock(class);
+            const blk = try self.acquireBlock();
+            errdefer self.recycleBlock(blk);
+
             blk.len = take;
             @memcpy(blk.data[0..take], data[off .. off + take]);
             try self.blocks.append(self.allocator, blk);
@@ -287,9 +274,7 @@ const MessageQueue = struct {
             remaining -= blk_left;
             self.offset = 0;
             self.head_idx += 1;
-            self.recycleBlock(blk) catch {
-                self.allocator.destroy(blk);
-            };
+            self.recycleBlock(blk);
         }
 
         if (self.head_idx > 0 and (self.head_idx >= self.blocks.items.len or self.head_idx >= 64)) {
@@ -307,34 +292,29 @@ const MessageQueue = struct {
         }
     }
 
-    fn acquireBlock(self: *MessageQueue, class: MsgBlockClass) !*MsgBlock {
-        const list = switch (class) {
-            .tiny => &self.tiny_free,
-            .small => &self.small_free,
-            .standard => &self.std_free,
-        };
-
-        if (list.items.len > 0) {
-            return list.pop().?;
+    fn acquireBlock(self: *MessageQueue) !*MsgBlock {
+        if (self.free.items.len > 0) {
+            return self.free.pop().?;
         }
 
         const blk = try self.allocator.create(MsgBlock);
         blk.* = .{
-            .class = class,
             .len = 0,
             .data = undefined,
         };
         return blk;
     }
 
-    fn recycleBlock(self: *MessageQueue, blk: *MsgBlock) !void {
+    fn recycleBlock(self: *MessageQueue, blk: *MsgBlock) void {
         blk.len = 0;
-        const list = switch (blk.class) {
-            .tiny => &self.tiny_free,
-            .small => &self.small_free,
-            .standard => &self.std_free,
+        if (self.free.items.len >= msg_free_cap_per_queue) {
+            self.allocator.destroy(blk);
+            return;
+        }
+
+        self.free.append(self.allocator, blk) catch {
+            self.allocator.destroy(blk);
         };
-        try list.append(self.allocator, blk);
     }
 };
 
@@ -560,7 +540,9 @@ const ConnectionSlot = struct {
     use_middle_proxy: bool = false,
     is_media_path: bool = false,
 
-    upstream_candidates: ?[]net.Address = null,
+    upstream_candidates_inline: [upstream_candidates_inline_cap]net.Address = undefined,
+    upstream_candidates_heap: ?[]net.Address = null,
+    upstream_candidate_count: u8 = 0,
     upstream_candidate_next: u8 = 0,
     direct_fallback_addr: ?net.Address = null,
     direct_fallback_used: bool = false,
@@ -584,8 +566,6 @@ const ConnectionSlot = struct {
     },
     c2s_bytes: u64 = 0,
     s2c_bytes: u64 = 0,
-
-    read_buf: ?[]u8 = null,
 
     // Non-blocking write queues (slab-like chain buffers)
     client_queue: MessageQueue = .{ .allocator = std.heap.page_allocator },
@@ -616,6 +596,7 @@ const ConnectionSlot = struct {
     client_interest_out: bool = false,
     upstream_interest_in: bool = false,
     upstream_interest_out: bool = false,
+    desync_wait_enqueued: bool = false,
 
     fn hasClientPending(self: *const ConnectionSlot) bool {
         return !self.client_queue.isEmpty();
@@ -664,17 +645,15 @@ const ConnectionSlot = struct {
         if (self.middle_ctx) |*mp| mp.deinit(allocator);
         self.middle_ctx = null;
 
-        if (self.upstream_candidates) |buf| allocator.free(buf);
-        self.upstream_candidates = null;
+        if (self.upstream_candidates_heap) |buf| allocator.free(buf);
+        self.upstream_candidates_heap = null;
+        self.upstream_candidate_count = 0;
         self.upstream_candidate_next = 0;
         self.direct_fallback_addr = null;
         self.direct_fallback_used = false;
         self.current_upstream_addr = null;
         self.dc_abs = 0;
         self.is_media_path = false;
-
-        if (self.read_buf) |buf| allocator.free(buf);
-        self.read_buf = null;
 
         if (self.mp_frame_buf) |buf| allocator.free(buf);
         self.mp_frame_buf = null;
@@ -696,6 +675,57 @@ const ConnectionSlot = struct {
     fn clientHelloBuf(self: *ConnectionSlot) []u8 {
         if (self.client_hello_heap) |buf| return buf;
         return self.client_hello_inline[0..self.client_hello_len];
+    }
+
+    fn upstreamCandidates(self: *const ConnectionSlot) []const net.Address {
+        const count: usize = self.upstream_candidate_count;
+        if (count == 0) return &.{};
+        if (self.upstream_candidates_heap) |buf| return buf[0..count];
+        return self.upstream_candidates_inline[0..count];
+    }
+
+    fn setUpstreamCandidates(self: *ConnectionSlot, allocator: std.mem.Allocator, candidates: []const net.Address) !void {
+        if (self.upstream_candidates_heap) |buf| {
+            allocator.free(buf);
+            self.upstream_candidates_heap = null;
+        }
+
+        if (candidates.len == 0) {
+            self.upstream_candidate_count = 0;
+            return;
+        }
+
+        if (candidates.len <= self.upstream_candidates_inline.len) {
+            @memcpy(self.upstream_candidates_inline[0..candidates.len], candidates);
+            self.upstream_candidate_count = @intCast(candidates.len);
+            return;
+        }
+
+        const heap = try allocator.alloc(net.Address, candidates.len);
+        errdefer allocator.free(heap);
+
+        @memcpy(heap, candidates);
+        self.upstream_candidates_heap = heap;
+        self.upstream_candidate_count = @intCast(candidates.len);
+    }
+};
+
+pub const BenchCandidatePath = struct {
+    slot: ConnectionSlot = .{},
+
+    pub fn deinit(self: *BenchCandidatePath, allocator: std.mem.Allocator) void {
+        self.slot.resetOwnedBuffers(allocator);
+    }
+
+    pub fn apply(self: *BenchCandidatePath, allocator: std.mem.Allocator, candidates: []const net.Address) !usize {
+        if (candidates.len == 0) return error.BenchEmptyCandidates;
+
+        try self.slot.setUpstreamCandidates(allocator, candidates);
+
+        const prepared = self.slot.upstreamCandidates();
+        self.slot.upstream_candidate_next = 1;
+        self.slot.current_upstream_addr = prepared[0];
+        return prepared.len;
     }
 };
 
@@ -790,11 +820,6 @@ const ConnectionPool = struct {
     }
 };
 
-fn slotCandidateCount(slot: *const ConnectionSlot) usize {
-    if (slot.upstream_candidates) |c| return c.len;
-    return 0;
-}
-
 pub const ProxyState = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -825,6 +850,7 @@ pub const ProxyState = struct {
     middle_proxy_secret_len: usize,
     middle_proxy_nat_ip4: ?[4]u8,
     upstream: upstream_mod.Upstream,
+    tunnel_info: tunnel_mod.Tunnel,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) ProxyState {
         var secrets: std.ArrayList(obfuscation.UserSecret) = .empty;
@@ -934,6 +960,36 @@ pub const ProxyState = struct {
             .middle_proxy_secret_len = middleproxy.proxy_secret.len,
             .middle_proxy_nat_ip4 = detected_nat_ip4,
             .upstream = upstream_mod.Upstream.initDirect(),
+            .tunnel_info = blk: {
+                const in_non_init_netns = isRunningInNonInitNetns();
+                switch (cfg.upstream_mode) {
+                    .direct => {
+                        if (in_non_init_netns) {
+                            log.warn("upstream.type=direct but proxy runs in non-init netns; egress still follows namespace routing", .{});
+                        }
+                        log.info("Upstream mode: direct (configured)", .{});
+                        break :blk tunnel_mod.Tunnel{ .tag = .none };
+                    },
+                    .amnezia_wg => {
+                        const t = tunnel_mod.Tunnel{ .tag = .amnezia_wg };
+                        if (in_non_init_netns) {
+                            log.info("Upstream mode: {s} (configured)", .{t.name()});
+                        } else {
+                            log.warn("upstream.type=amnezia_wg configured, but proxy is not running in tunnel netns", .{});
+                        }
+                        break :blk t;
+                    },
+                    .auto => {
+                        if (in_non_init_netns) {
+                            const t = tunnel_mod.Tunnel{ .tag = .amnezia_wg };
+                            log.info("Upstream mode: {s} (auto-detected from network namespace)", .{t.name()});
+                            break :blk t;
+                        }
+                        log.info("Upstream mode: direct (auto)", .{});
+                        break :blk tunnel_mod.Tunnel{ .tag = .none };
+                    },
+                }
+            },
         };
     }
 
@@ -943,6 +999,14 @@ pub const ProxyState = struct {
 
     pub fn run(self: *ProxyState) !void {
         if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+
+        if (self.config.upstream_mode == .amnezia_wg and !isRunningInNonInitNetns()) {
+            log.err(
+                "upstream.type=amnezia_wg requires running proxy inside tunnel netns (expected via `mtbuddy setup tunnel`)",
+                .{},
+            );
+            return error.UpstreamTunnelNotActive;
+        }
 
         const address = net.Address.initIp6(
             .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
@@ -1057,8 +1121,11 @@ pub const ProxyState = struct {
     }
 
     fn refreshMiddleProxyInfo(self: *ProxyState) !void {
-        const cfg_bytes = try fetchUrlBytes(self.allocator, middle_proxy_config_url);
-        defer self.allocator.free(cfg_bytes);
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const temp_alloc = arena.allocator();
+
+        const cfg_bytes = try fetchUrlBytes(temp_alloc, middle_proxy_config_url);
 
         var next_primary: [5]?net.Address = [_]?net.Address{null} ** 5;
         var next_dc4_candidates: [16]net.Address = undefined;
@@ -1094,8 +1161,7 @@ pub const ProxyState = struct {
         }
         const next_addr_203 = if (count_203 == 0) null else candidates_203[0];
 
-        const next_secret = try fetchUrlBytes(self.allocator, middle_proxy_secret_url);
-        defer self.allocator.free(next_secret);
+        const next_secret = try fetchUrlBytes(temp_alloc, middle_proxy_secret_url);
 
         if (next_secret.len < 16 or next_secret.len > self.middle_proxy_secret.len) {
             return error.BadMiddleProxySecret;
@@ -1181,6 +1247,8 @@ const EventLoop = struct {
     prev_dropped_hs_budget: u64,
     prev_hs_timeout: u64,
     prev_mp_fallback: u64,
+    shared_read_buf: [read_buf_size]u8,
+    desync_wait_slots: std.ArrayListUnmanaged(u32),
     mp_c2s_scratch: ?[]u8,
     mp_s2c_scratch: ?[]u8,
 
@@ -1207,6 +1275,8 @@ const EventLoop = struct {
             .prev_dropped_hs_budget = 0,
             .prev_hs_timeout = 0,
             .prev_mp_fallback = 0,
+            .shared_read_buf = undefined,
+            .desync_wait_slots = .{},
             .mp_c2s_scratch = null,
             .mp_s2c_scratch = null,
         };
@@ -1227,6 +1297,7 @@ const EventLoop = struct {
 
         if (self.mp_c2s_scratch) |buf| self.state.allocator.free(buf);
         if (self.mp_s2c_scratch) |buf| self.state.allocator.free(buf);
+        self.desync_wait_slots.deinit(self.state.allocator);
 
         self.pool.deinit();
         posix.close(self.epoll_fd);
@@ -1238,7 +1309,12 @@ const EventLoop = struct {
         var next_timer_tick_ns: i128 = std.time.nanoTimestamp();
 
         while (true) {
-            const rc = linux.epoll_wait(self.epoll_fd, events[0..].ptr, @intCast(events.len), event_loop_wait_ms);
+            var current_wait_ms: i32 = event_loop_wait_ms;
+            if (self.desync_wait_slots.items.len > 0) {
+                current_wait_ms = @min(current_wait_ms, desync_wait_poll_ms);
+            }
+
+            const rc = linux.epoll_wait(self.epoll_fd, events[0..].ptr, @intCast(events.len), current_wait_ms);
             switch (posix.errno(rc)) {
                 .SUCCESS => {},
                 .INTR => continue,
@@ -1259,6 +1335,8 @@ const EventLoop = struct {
                 const slot = self.pool.getByFd(fd) orelse continue;
                 self.processSlotEvent(slot, fd, ev_flags);
             }
+
+            self.processDesyncWaits();
 
             const now_ns = std.time.nanoTimestamp();
             if (self.accept_paused and now_ns >= self.accept_resume_ns) {
@@ -1346,6 +1424,9 @@ const EventLoop = struct {
                 }
             };
             accepted_this_round += 1;
+
+            // Ensure desync byte-splitting is not coalesced by Nagle during early handshake.
+            setTcpNoDelay(cfd);
 
             // Per-/24 subnet rate limit (before we allocate any slot)
             if (!self.subnet_limiter.check(client_addr, self.state.config.rate_limit_per_subnet)) {
@@ -1552,6 +1633,10 @@ const EventLoop = struct {
                 if (!slot.hasClientPending()) {
                     slot.phase = .desync_wait;
                     slot.desync_deadline_ns = std.time.nanoTimestamp() + (3 * std.time.ns_per_ms);
+                    self.enqueueDesyncWait(slot) catch {
+                        self.closeSlot(slot, "desync wait queue failed");
+                        return;
+                    };
                 }
             },
             .writing_server_hello_rest => {
@@ -1629,6 +1714,57 @@ const EventLoop = struct {
         if (!slot.hasUpstreamPending() and slot.dc_initial_tail == null) {
             self.startRelay(slot);
         }
+    }
+
+    fn enqueueDesyncWait(self: *EventLoop, slot: *ConnectionSlot) !void {
+        if (slot.desync_wait_enqueued) return;
+        try self.desync_wait_slots.append(self.state.allocator, slot.index);
+        slot.desync_wait_enqueued = true;
+    }
+
+    fn processDesyncWaits(self: *EventLoop) void {
+        if (self.desync_wait_slots.items.len == 0) return;
+
+        const now_ns = std.time.nanoTimestamp();
+        var write_idx: usize = 0;
+        var read_idx: usize = 0;
+
+        while (read_idx < self.desync_wait_slots.items.len) : (read_idx += 1) {
+            const slot_idx = self.desync_wait_slots.items[read_idx];
+            const slot = self.pool.slots[slot_idx] orelse continue;
+
+            if (slot.phase != .desync_wait) {
+                slot.desync_wait_enqueued = false;
+                continue;
+            }
+
+            if (now_ns < slot.desync_deadline_ns) {
+                self.desync_wait_slots.items[write_idx] = slot_idx;
+                write_idx += 1;
+                continue;
+            }
+
+            slot.desync_wait_enqueued = false;
+            slot.phase = .writing_server_hello_rest;
+
+            if (slot.server_hello) |sh| {
+                if (slot.server_hello_off < sh.len) {
+                    if (queueClient(slot, self.state.allocator, sh[slot.server_hello_off..])) |_| {
+                        slot.server_hello_off = sh.len;
+                    } else |_| {
+                        self.closeSlot(slot, "desync rest write failed");
+                        continue;
+                    }
+                }
+            }
+
+            self.syncInterests(slot) catch |err| {
+                log.debug("[{d}] desync syncInterests error: {any}", .{ slot.conn_id, err });
+                self.closeSlot(slot, "desync sync interests failed");
+            };
+        }
+
+        self.desync_wait_slots.shrinkRetainingCapacity(write_idx);
     }
 
     fn readTlsHeader(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -1829,10 +1965,7 @@ const EventLoop = struct {
                 continue;
             }
 
-            const read_buf = ensureReadBuf(slot, self.state.allocator) catch {
-                self.closeSlot(slot, "alloc read buffer failed");
-                return;
-            };
+            const read_buf = self.shared_read_buf[0..];
             const want = @min(remaining, read_buf.len);
             const n = posix.read(slot.client_fd, read_buf[0..want]) catch |err| {
                 if (err == error.WouldBlock) return;
@@ -1934,20 +2067,12 @@ const EventLoop = struct {
             });
         }
 
-        if (slot.upstream_candidates) |old| {
-            self.state.allocator.free(old);
-            slot.upstream_candidates = null;
-        }
-
-        slot.upstream_candidates = self.state.allocator.alloc(net.Address, plan.count) catch {
+        slot.setUpstreamCandidates(self.state.allocator, plan.candidates[0..plan.count]) catch {
             self.closeSlot(slot, "alloc upstream candidate list failed");
             return;
         };
-        const candidates = slot.upstream_candidates.?;
-        var idx: usize = 0;
-        while (idx < candidates.len) : (idx += 1) {
-            candidates[idx] = plan.candidates[idx];
-        }
+
+        const candidates = slot.upstreamCandidates();
         slot.upstream_candidate_next = 1;
         slot.current_upstream_addr = candidates[0];
 
@@ -2054,11 +2179,13 @@ const EventLoop = struct {
 
     fn tryNextDcEndpoint(self: *EventLoop, slot: *ConnectionSlot, err: anyerror) bool {
         const attempt_addr = slot.current_upstream_addr;
-        const candidates = slot.upstream_candidates orelse return false;
-        const candidate_count = slotCandidateCount(slot);
+        const candidates = slot.upstreamCandidates();
+        if (candidates.len == 0) return false;
+        const candidate_count = candidates.len;
 
-        if (slot.upstream_candidate_next < candidates.len) {
-            const next_idx = slot.upstream_candidate_next;
+        const next_u: usize = slot.upstream_candidate_next;
+        if (next_u < candidates.len) {
+            const next_idx = next_u;
             const next_addr = candidates[next_idx];
             slot.upstream_candidate_next += 1;
             self.startConnectUpstream(slot, next_addr, .dc) catch |next_err| {
@@ -2091,15 +2218,10 @@ const EventLoop = struct {
             const fallback = slot.direct_fallback_addr.?;
             slot.upstream_candidate_next = 1;
 
-            if (slot.upstream_candidates) |old| {
-                self.state.allocator.free(old);
-                slot.upstream_candidates = null;
-            }
-            const one = self.state.allocator.alloc(net.Address, 1) catch {
+            var one = [_]net.Address{fallback};
+            slot.setUpstreamCandidates(self.state.allocator, one[0..]) catch {
                 return false;
             };
-            one[0] = fallback;
-            slot.upstream_candidates = one;
 
             self.startConnectUpstream(slot, fallback, .dc) catch |fallback_err| {
                 log.warn("[{d}] direct fallback connect failed: {any}", .{ slot.conn_id, fallback_err });
@@ -2257,7 +2379,7 @@ const EventLoop = struct {
         else
             null;
 
-        const progress = relayClientToUpstreamStep(slot, self.state.allocator, mp_c2s_scratch) catch |err| {
+        const progress = relayClientToUpstreamStep(slot, self.state.allocator, mp_c2s_scratch, self.shared_read_buf[0..]) catch |err| {
             if (slot.is_media_path) {
                 log.debug("[{d}] relay c2s error: dc_idx={d} err={any} c2s={d} s2c={d}", .{
                     slot.conn_id, slot.dc_idx, err, slot.c2s_bytes, slot.s2c_bytes,
@@ -2282,7 +2404,7 @@ const EventLoop = struct {
         else
             null;
 
-        const progress = relayUpstreamToClientStep(slot, self.state.allocator, mp_s2c_scratch) catch |err| {
+        const progress = relayUpstreamToClientStep(slot, self.state.allocator, mp_s2c_scratch, self.shared_read_buf[0..]) catch |err| {
             if (slot.is_media_path) {
                 log.debug("[{d}] relay s2c error: dc_idx={d} err={any} c2s={d} s2c={d}", .{
                     slot.conn_id, slot.dc_idx, err, slot.c2s_bytes, slot.s2c_bytes,
@@ -2299,49 +2421,45 @@ const EventLoop = struct {
     fn relayRawClientToUpstream(self: *EventLoop, slot: *ConnectionSlot) void {
         if (slot.hasUpstreamPending()) return;
 
-        const read_buf = ensureReadBuf(slot, self.state.allocator) catch {
-            slot.phase = .closing;
-            return;
-        };
+        const read_buf = self.shared_read_buf[0..];
 
         const n = posix.read(slot.client_fd, read_buf) catch |err| {
             if (err == error.WouldBlock) return;
-            slot.phase = .closing;
+            self.closeSlot(slot, "mask relay c2s read error");
             return;
         };
         if (n == 0) {
-            slot.phase = .closing;
+            self.closeSlot(slot, "mask relay c2s eof");
             return;
         }
 
         _ = queueUpstream(slot, self.state.allocator, read_buf[0..n]) catch {
-            slot.phase = .closing;
+            self.closeSlot(slot, "mask relay c2s queue error");
             return;
         };
+        slot.last_activity_ms = std.time.milliTimestamp();
     }
 
     fn relayRawUpstreamToClient(self: *EventLoop, slot: *ConnectionSlot) void {
         if (slot.hasClientPending()) return;
 
-        const read_buf = ensureReadBuf(slot, self.state.allocator) catch {
-            slot.phase = .closing;
-            return;
-        };
+        const read_buf = self.shared_read_buf[0..];
 
         const n = posix.read(slot.upstream_fd, read_buf) catch |err| {
             if (err == error.WouldBlock) return;
-            slot.phase = .closing;
+            self.closeSlot(slot, "mask relay s2c read error");
             return;
         };
         if (n == 0) {
-            slot.phase = .closing;
+            self.closeSlot(slot, "mask relay s2c eof");
             return;
         }
 
         _ = queueClient(slot, self.state.allocator, read_buf[0..n]) catch {
-            slot.phase = .closing;
+            self.closeSlot(slot, "mask relay s2c queue error");
             return;
         };
+        slot.last_activity_ms = std.time.milliTimestamp();
     }
 
     fn middleProxyBegin(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -2661,15 +2779,10 @@ const EventLoop = struct {
         self.cleanupFailedUpstreamConnect(slot);
         slot.upstream_candidate_next = 1;
 
-        if (slot.upstream_candidates) |old| {
-            self.state.allocator.free(old);
-            slot.upstream_candidates = null;
-        }
-        const one = self.state.allocator.alloc(net.Address, 1) catch {
+        var one = [_]net.Address{fallback};
+        slot.setUpstreamCandidates(self.state.allocator, one[0..]) catch {
             return false;
         };
-        one[0] = fallback;
-        slot.upstream_candidates = one;
 
         self.startConnectUpstream(slot, fallback, .dc) catch |err| {
             log.warn("[{d}] direct fallback connect start failed: {any}", .{ slot.conn_id, err });
@@ -2850,7 +2963,6 @@ const EventLoop = struct {
 
     fn runTimers(self: *EventLoop) void {
         const now_ms = std.time.milliTimestamp();
-        const now_ns = std.time.nanoTimestamp();
 
         const hi: usize = @intCast(self.pool.allocated_hi);
         if (hi == 0) return;
@@ -2867,19 +2979,6 @@ const EventLoop = struct {
 
             const slot = slot_opt orelse continue;
             if (slot.phase == .idle) continue;
-
-            if (slot.phase == .desync_wait and now_ns >= slot.desync_deadline_ns) {
-                slot.phase = .writing_server_hello_rest;
-                if (slot.server_hello) |sh| {
-                    if (slot.server_hello_off < sh.len) {
-                        if (queueClient(slot, self.state.allocator, sh[slot.server_hello_off..])) |_| {} else |_| {
-                            self.closeSlot(slot, "desync rest write failed");
-                            continue;
-                        }
-                        slot.server_hello_off = sh.len;
-                    }
-                }
-            }
 
             if (slot.phase == .closing) {
                 self.closeSlot(slot, "closing phase");
@@ -3039,6 +3138,7 @@ const EventLoop = struct {
             self.closed_since_log += 1;
         }
 
+        slot.desync_wait_enqueued = false;
         slot.phase = .idle;
         self.pool.release(slot);
     }
@@ -3079,15 +3179,24 @@ const EventLoop = struct {
 
     fn appendPipelined(self: *EventLoop, slot: *ConnectionSlot, extra: []const u8) !void {
         if (extra.len == 0) return;
+
+        const current_len: usize = if (slot.pipelined_data) |p| p.len else 0;
+        const next_len = std.math.add(usize, current_len, extra.len) catch {
+            return error.PipelinedDataTooLarge;
+        };
+        if (next_len > max_pipelined_handshake_bytes) {
+            return error.PipelinedDataTooLarge;
+        }
+
         if (slot.pipelined_data == null) {
-            const buf = try self.state.allocator.alloc(u8, extra.len);
+            const buf = try self.state.allocator.alloc(u8, next_len);
             @memcpy(buf, extra);
             slot.pipelined_data = buf;
             return;
         }
 
         const prev = slot.pipelined_data.?;
-        const next = try self.state.allocator.alloc(u8, prev.len + extra.len);
+        const next = try self.state.allocator.alloc(u8, next_len);
         @memcpy(next[0..prev.len], prev);
         @memcpy(next[prev.len..], extra);
         self.state.allocator.free(prev);
@@ -3095,8 +3204,7 @@ const EventLoop = struct {
     }
 };
 
-fn relayClientToUpstreamStep(slot: *ConnectionSlot, allocator: std.mem.Allocator, mp_c2s_scratch: ?[]u8) !RelayProgress {
-    const read_buf = try ensureReadBuf(slot, allocator);
+fn relayClientToUpstreamStep(slot: *ConnectionSlot, allocator: std.mem.Allocator, mp_c2s_scratch: ?[]u8, read_buf: []u8) !RelayProgress {
     var consumed_any = false;
 
     while (true) {
@@ -3181,8 +3289,7 @@ fn relayClientToUpstreamStep(slot: *ConnectionSlot, allocator: std.mem.Allocator
     }
 }
 
-fn relayUpstreamToClientStep(slot: *ConnectionSlot, allocator: std.mem.Allocator, mp_s2c_scratch: ?[]u8) !RelayProgress {
-    const read_buf = try ensureReadBuf(slot, allocator);
+fn relayUpstreamToClientStep(slot: *ConnectionSlot, allocator: std.mem.Allocator, mp_s2c_scratch: ?[]u8, read_buf: []u8) !RelayProgress {
     const n = posix.read(slot.upstream_fd, read_buf) catch |err| {
         if (err == error.WouldBlock) return .none;
         return err;
@@ -3340,13 +3447,6 @@ fn formatAddress(addr: net.Address, buf: *[64]u8) []const u8 {
         },
         else => return "?",
     }
-}
-
-fn ensureReadBuf(slot: *ConnectionSlot, allocator: std.mem.Allocator) ![]u8 {
-    if (slot.read_buf) |buf| return buf;
-    const buf = try allocator.alloc(u8, read_buf_size);
-    slot.read_buf = buf;
-    return buf;
 }
 
 fn ensureMpFrameBuf(slot: *ConnectionSlot, allocator: std.mem.Allocator) ![]u8 {
@@ -3813,6 +3913,9 @@ fn flushQueue(fd: posix.fd_t, queue: *MessageQueue) !bool {
         const n_iov = queue.prepareIovecs(iovecs[0..]);
         if (n_iov == 0) return true;
 
+        var total_req: usize = 0;
+        for (iovecs[0..n_iov]) |iov| total_req += iov.len;
+
         const n = posix.writev(fd, iovecs[0..n_iov]) catch |err| {
             if (err == error.WouldBlock) return false;
             return err;
@@ -3821,7 +3924,7 @@ fn flushQueue(fd: posix.fd_t, queue: *MessageQueue) !bool {
         if (n == 0) return error.ConnectionReset;
         try queue.consume(n);
 
-        if (n < iovecs[0].len) return false;
+        if (n < total_req) return false;
     }
 
     return true;
@@ -3989,6 +4092,18 @@ test "message queue consume is stable" {
     try std.testing.expect(q.isEmpty());
     try std.testing.expectEqual(@as(usize, 0), q.offset);
     try std.testing.expectEqual(@as(usize, 0), q.head_idx);
+}
+
+test "message queue append fills tail block" {
+    var q = MessageQueue{ .allocator = std.testing.allocator };
+    defer q.deinit();
+
+    try q.appendCopy("abcde");
+    try q.appendCopy("fghij");
+
+    try std.testing.expectEqual(@as(usize, 10), q.total_len);
+    try std.testing.expectEqual(@as(usize, 1), q.blocks.items.len);
+    try std.testing.expectEqual(@as(usize, 10), q.blocks.items[0].len);
 }
 
 test "epoll hangup helper" {

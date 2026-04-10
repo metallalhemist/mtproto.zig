@@ -2,10 +2,15 @@ const std = @import("std");
 const net = std.net;
 const crypto = @import("crypto/crypto.zig");
 const middleproxy = @import("protocol/middleproxy.zig");
+const obfuscation = @import("protocol/obfuscation.zig");
 const constants = @import("protocol/constants.zig");
+const tls = @import("protocol/tls.zig");
+const proxy = @import("proxy/proxy.zig");
 
 const Mode = enum {
     bench,
+    handshake,
+    handshake_path,
     soak,
 };
 
@@ -14,6 +19,8 @@ const Options = struct {
     seconds: u32 = 30,
     threads: usize = 0,
     max_payload: usize = 128 * 1024,
+    iterations: usize = 1_000_000,
+    candidate_count: usize = 4,
 };
 
 const SoakShared = struct {
@@ -44,6 +51,8 @@ pub fn main() !void {
 
     switch (opts.mode) {
         .bench => try runBench(allocator),
+        .handshake => try runHandshakeBench(allocator, opts.iterations),
+        .handshake_path => try runHandshakePathBench(allocator, opts),
         .soak => try runSoak(allocator, opts),
     }
 }
@@ -99,6 +108,124 @@ fn runBench(allocator: std.mem.Allocator) !void {
             bytesPerSecToMiB(produced_out_bytes, elapsed_ns),
         });
     }
+}
+
+fn runHandshakeBench(allocator: std.mem.Allocator, iterations: usize) !void {
+    const bench_secret = [_]u8{0x42} ** 16;
+    const user_secrets = [_]tls.UserSecret{.{ .name = "bench", .secret = bench_secret }};
+
+    var handshake = [_]u8{0} ** 96;
+    handshake[constants.tls_digest_pos + constants.tls_digest_len] = 32;
+    @memset(handshake[44..76], 0xaa);
+
+    var canonical_input = handshake;
+    @memset(canonical_input[constants.tls_digest_pos..][0..constants.tls_digest_len], 0);
+    const canonical = crypto.sha256Hmac(&bench_secret, &canonical_input);
+
+    @memcpy(handshake[constants.tls_digest_pos..][0..28], canonical[0..28]);
+    const ts: u32 = 0x11223344;
+    const ts_bytes = std.mem.toBytes(ts);
+    handshake[constants.tls_digest_pos + 28] = canonical[28] ^ ts_bytes[0];
+    handshake[constants.tls_digest_pos + 29] = canonical[29] ^ ts_bytes[1];
+    handshake[constants.tls_digest_pos + 30] = canonical[30] ^ ts_bytes[2];
+    handshake[constants.tls_digest_pos + 31] = canonical[31] ^ ts_bytes[3];
+
+    var warmup: usize = 0;
+    while (warmup < 1000) : (warmup += 1) {
+        const ok = try tls.validateTlsHandshake(allocator, &handshake, &user_secrets, true);
+        if (ok == null) return error.BenchmarkValidationFailed;
+    }
+
+    var timer = try std.time.Timer.start();
+    var matched: usize = 0;
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        const ok = try tls.validateTlsHandshake(allocator, &handshake, &user_secrets, true);
+        if (ok != null) matched += 1;
+    }
+
+    const elapsed_ns = timer.read();
+    const ns_per_op = elapsedNsPerOp(elapsed_ns, iterations);
+    const ops_per_sec = if (elapsed_ns == 0)
+        0
+    else
+        @as(u64, @intCast((@as(u128, iterations) * std.time.ns_per_s) / elapsed_ns));
+
+    std.debug.print("benchmark: validateTlsHandshake\n", .{});
+    std.debug.print("iterations matched ns_per_op ops_per_sec\n", .{});
+    std.debug.print("{d} {d} {d} {d}\n", .{ iterations, matched, ns_per_op, ops_per_sec });
+}
+
+fn runHandshakePathBench(allocator: std.mem.Allocator, opts: Options) !void {
+    if (opts.candidate_count == 0 or opts.candidate_count > 16) return error.InvalidArgument;
+
+    const bench_secret = [_]u8{0x33} ** 16;
+    const user_secrets = [_]obfuscation.UserSecret{.{ .name = "bench", .secret = bench_secret }};
+
+    var handshakes: [8][constants.handshake_len]u8 = undefined;
+    for (&handshakes, 0..) |*handshake, idx| {
+        const dc_idx: i16 = @intCast(idx + 1);
+        const nonce_seed: u8 = @intCast(23 + idx * 11);
+        handshake.* = buildObfuscationHandshake(&bench_secret, .intermediate, dc_idx, nonce_seed);
+    }
+
+    var candidates: [16]net.Address = undefined;
+    fillBenchmarkCandidates(&candidates);
+    const windows = candidates.len - opts.candidate_count + 1;
+
+    var candidate_state = proxy.BenchCandidatePath{};
+    defer candidate_state.deinit(allocator);
+
+    const warmup_iters = @min(opts.iterations, @as(usize, 2000));
+    var warmup: usize = 0;
+    while (warmup < warmup_iters) : (warmup += 1) {
+        const handshake_idx = warmup % handshakes.len;
+        const parsed = obfuscation.ObfuscationParams.fromHandshake(&handshakes[handshake_idx], &user_secrets) orelse {
+            return error.BenchmarkValidationFailed;
+        };
+        _ = parsed;
+
+        const base = if (windows > 1) warmup % windows else 0;
+        _ = try candidate_state.apply(allocator, candidates[base .. base + opts.candidate_count]);
+    }
+
+    var timer = try std.time.Timer.start();
+    var matched: usize = 0;
+    var checksum: u64 = 0;
+    var i: usize = 0;
+    while (i < opts.iterations) : (i += 1) {
+        const handshake_idx = i % handshakes.len;
+        const parsed = obfuscation.ObfuscationParams.fromHandshake(&handshakes[handshake_idx], &user_secrets) orelse {
+            return error.BenchmarkValidationFailed;
+        };
+        matched += 1;
+
+        const base = if (windows > 1) i % windows else 0;
+        const candidate_slice = candidates[base .. base + opts.candidate_count];
+        const candidate_len = try candidate_state.apply(allocator, candidate_slice);
+
+        checksum +%= @as(u64, @intCast(candidate_len));
+        checksum +%= @as(u64, @intCast(@abs(parsed.params.dc_idx)));
+        checksum +%= std.mem.bigToNative(u16, candidate_slice[0].in.sa.port);
+    }
+
+    const elapsed_ns = timer.read();
+    const ns_per_op = elapsedNsPerOp(elapsed_ns, opts.iterations);
+    const ops_per_sec = if (elapsed_ns == 0)
+        0
+    else
+        @as(u64, @intCast((@as(u128, opts.iterations) * std.time.ns_per_s) / elapsed_ns));
+
+    std.debug.print("benchmark: finishClientHandshake candidate-path\n", .{});
+    std.debug.print("iterations candidate_count matched ns_per_op ops_per_sec checksum\n", .{});
+    std.debug.print("{d} {d} {d} {d} {d} {d}\n", .{
+        opts.iterations,
+        opts.candidate_count,
+        matched,
+        ns_per_op,
+        ops_per_sec,
+        checksum,
+    });
 }
 
 fn runSoak(allocator: std.mem.Allocator, opts: Options) !void {
@@ -217,6 +344,44 @@ fn fillPayload(buf: []u8) void {
     }
 }
 
+fn buildObfuscationHandshake(secret: *const [16]u8, proto_tag: constants.ProtoTag, dc_idx: i16, nonce_seed: u8) [constants.handshake_len]u8 {
+    var nonce = [_]u8{0} ** constants.handshake_len;
+    for (&nonce, 0..) |*byte, idx| {
+        byte.* = @truncate((idx * 29 + nonce_seed) % 251);
+    }
+
+    const tag_bytes = proto_tag.toBytes();
+    @memcpy(nonce[constants.proto_tag_pos..][0..4], &tag_bytes);
+    std.mem.writeInt(i16, nonce[constants.dc_idx_pos..][0..2], dc_idx, .little);
+
+    var key_input: [constants.prekey_len + 16]u8 = undefined;
+    @memcpy(key_input[0..constants.prekey_len], nonce[constants.skip_len .. constants.skip_len + constants.prekey_len]);
+    @memcpy(key_input[constants.prekey_len..], secret);
+    const decrypt_key = crypto.sha256(&key_input);
+    const decrypt_iv = std.mem.readInt(
+        u128,
+        nonce[constants.skip_len + constants.prekey_len ..][0..constants.iv_len],
+        .big,
+    );
+
+    var encrypted = nonce;
+    var encryptor = crypto.AesCtr.init(&decrypt_key, decrypt_iv);
+    defer encryptor.wipe();
+    encryptor.apply(&encrypted);
+
+    var handshake = nonce;
+    @memcpy(handshake[constants.proto_tag_pos..], encrypted[constants.proto_tag_pos..]);
+    return handshake;
+}
+
+fn fillBenchmarkCandidates(out: *[16]net.Address) void {
+    for (out, 0..) |*addr, idx| {
+        const octet: u8 = @intCast(100 + idx);
+        const port = constants.tg_datacenter_port + @as(u16, @intCast(idx));
+        addr.* = net.Address.initIp4(.{ 149, 154, 167, octet }, port);
+    }
+}
+
 fn parseArgs(allocator: std.mem.Allocator) !Options {
     var opts = Options{};
 
@@ -227,6 +392,14 @@ fn parseArgs(allocator: std.mem.Allocator) !Options {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "bench")) {
             opts.mode = .bench;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "handshake")) {
+            opts.mode = .handshake;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "handshake-path")) {
+            opts.mode = .handshake_path;
             continue;
         }
         if (std.mem.eql(u8, arg, "soak")) {
@@ -248,6 +421,14 @@ fn parseArgs(allocator: std.mem.Allocator) !Options {
             opts.max_payload = try parsePositiveUsize(arg["--max-payload=".len..]);
             continue;
         }
+        if (std.mem.startsWith(u8, arg, "--iterations=")) {
+            opts.iterations = try parsePositiveUsize(arg["--iterations=".len..]);
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--candidate-count=")) {
+            opts.candidate_count = try parsePositiveUsize(arg["--candidate-count=".len..]);
+            continue;
+        }
 
         return error.InvalidArgument;
     }
@@ -258,6 +439,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Options {
     }
 
     if (opts.max_payload < 64) return error.InvalidArgument;
+    if (opts.candidate_count == 0 or opts.candidate_count > 16) return error.InvalidArgument;
 
     return opts;
 }
@@ -279,11 +461,18 @@ fn printUsage() void {
         \\Usage:
         \\  zig build bench
         \\  zig build bench -- --help
+        \\  zig build bench -- handshake --iterations=1000000
+        \\  zig build bench -- handshake-path --iterations=1000000 --candidate-count=4
         \\  zig build soak -- --seconds=30 --threads=8 --max-payload=131072
         \\
         \\Modes:
         \\  bench (default): microbenchmark for C2S encapsulation
+        \\  handshake: microbenchmark for TLS handshake validation
+        \\  handshake-path: microbenchmark for MTProto handshake + candidate staging
         \\  soak: multithreaded crash/stability stress test
+        \\Flags:
+        \\  --iterations=N       iterations for handshake and handshake-path
+        \\  --candidate-count=N  candidate list size for handshake-path (1..16)
         \\
     , .{});
 }
@@ -335,10 +524,15 @@ fn nextPayloadLen(state: *u64, max_payload: usize) usize {
     const pick_hot = (nextRand(state) % 10) < 7;
     if (pick_hot) {
         const idx: usize = @intCast(nextRand(state) % hot_sizes.len);
-        const capped = @min(hot_sizes[idx], max_payload);
-        return if (capped == 0) 1 else capped;
+        return normalizePayloadLen(hot_sizes[idx], max_payload);
     }
 
     const max_u64 = @as(u64, @intCast(@max(@as(usize, 1), max_payload)));
-    return 1 + @as(usize, @intCast(nextRand(state) % max_u64));
+    const random_len = 1 + @as(usize, @intCast(nextRand(state) % max_u64));
+    return normalizePayloadLen(random_len, max_payload);
+}
+
+fn normalizePayloadLen(payload_len: usize, max_payload: usize) usize {
+    const capped = @max(@as(usize, 4), @min(payload_len, max_payload));
+    return capped - @mod(capped, 4);
 }
