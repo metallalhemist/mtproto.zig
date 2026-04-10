@@ -1,152 +1,63 @@
-.PHONY: build release run test bench soak clean fmt deploy update-server migrate update-dns release-manual stability-check stability-check-load capacity-probe-idle capacity-probe-active deploy-tunnel deploy-tunnel-only deploy-monitor monitor
+.PHONY: help deploy update-server dashboard dashboard-tunnel test-stability test-capacity release
 
 SERVER ?= 185.125.46.60
 CONFIG ?= config.toml
-AWG_CONF ?=
-TUNNEL_MODE ?= direct
-HOST ?= 127.0.0.1
-PORT ?= 443
-PID ?=
+PORT   ?= 443
 
-build:
-	zig build
+.DEFAULT_GOAL := help
 
-release:
-	zig build -Doptimize=ReleaseFast
+help: ## Show this help message
+	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-release-manual:
-	@if [ -z "$(VERSION)" ]; then \
-		echo "Usage: make release-manual VERSION=v1.2.3"; \
-		exit 1; \
-	fi
-	@if git rev-parse "$(VERSION)" >/dev/null 2>&1; then \
-		echo "Tag $(VERSION) already exists"; \
-		exit 1; \
-	fi
-	git tag "$(VERSION)"
-	git push origin "$(VERSION)"
-	gh release create "$(VERSION)" --title "$(VERSION)" --generate-notes
+# ── server ops ────────────────────────────────────────────────────────────────
 
-run:
-	zig build run -- $(CONFIG)
-
-test:
-	zig build test
-
-bench:
-	zig build -Doptimize=ReleaseFast bench
-
-soak:
-	zig build -Doptimize=ReleaseFast soak -- --seconds=30
-
-fmt:
-	zig fmt src/
-
-clean:
-	rm -rf .zig-cache zig-out
-
-deploy:
+deploy: ## Build and push binary directly to server (dev iteration)
 	zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3
 	ssh root@$(SERVER) 'systemctl stop mtproto-proxy || true'
 	scp zig-out/bin/mtproto-proxy root@$(SERVER):/opt/mtproto-proxy/
-	scp deploy/*.sh root@$(SERVER):/opt/mtproto-proxy/
-	-if [ -f $(CONFIG) ]; then \
-		scp $(CONFIG) root@$(SERVER):/opt/mtproto-proxy/config.toml; \
+	-@if [ -f $(CONFIG) ]; then scp $(CONFIG) root@$(SERVER):/opt/mtproto-proxy/config.toml; fi
+	-@if [ -f .env ]; then \
+		awk '{print "export " $$0}' .env > .env.tmp && \
+		scp .env.tmp root@$(SERVER):/opt/mtproto-proxy/env.sh && \
+		ssh root@$(SERVER) 'chmod 600 /opt/mtproto-proxy/env.sh' && \
+		rm .env.tmp; \
 	fi
-	ssh root@$(SERVER) 'chmod +x /opt/mtproto-proxy/*.sh'
-	-if [ -f .env ]; then \
-		awk '{print "export " $$0}' .env > .env.tmp_deploy; \
-		scp .env.tmp_deploy root@$(SERVER):/opt/mtproto-proxy/env.sh; \
-		ssh root@$(SERVER) 'chmod 600 /opt/mtproto-proxy/env.sh'; \
-		rm .env.tmp_deploy; \
-	fi
-	ssh root@$(SERVER) 'chown -R mtproto:mtproto /opt/mtproto-proxy/'
-	ssh root@$(SERVER) 'systemctl start mtproto-proxy && systemctl status mtproto-proxy --no-pager'
+	ssh root@$(SERVER) 'chown -R mtproto:mtproto /opt/mtproto-proxy/ && systemctl start mtproto-proxy'
 
-update-server:
-	@if [ -z "$(SERVER)" ]; then echo "Usage: make update-server SERVER=<ip> [VERSION=vX.Y.Z]"; exit 1; fi
-	@if [ -n "$(VERSION)" ]; then \
-		ssh root@$(SERVER) 'bash -s -- $(VERSION)' < deploy/update.sh; \
-	else \
-		ssh root@$(SERVER) 'bash -s' < deploy/update.sh; \
-	fi
+update: ## Trigger mtbuddy update on the server (Usage: make update SERVER=<ip> [VERSION=vX.Y.Z])
+	@if [ -z "$(SERVER)" ]; echo "Usage: make update SERVER=<ip> [VERSION=...]" && exit 1; fi
+	ssh root@$(SERVER) 'mtbuddy update $(if $(VERSION),--version $(VERSION),)'
 
-migrate:
-	@if [ -z "$(SERVER)" ]; then echo "Usage: make migrate SERVER=<ip> [PASSWORD=<pass>]"; exit 1; fi
-	@echo "--- 1. Setting up SSH key ---"
-	@if [ -n "$(PASSWORD)" ]; then \
-		PUBKEY=$$(cat ~/.ssh/id_rsa.pub 2>/dev/null || cat ~/.ssh/id_ed25519.pub 2>/dev/null); \
-		if [ -n "$$PUBKEY" ]; then \
-			sshpass -p '$(PASSWORD)' ssh -o StrictHostKeyChecking=no root@$(SERVER) "mkdir -p ~/.ssh && echo \"$$PUBKEY\" >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && chmod 700 ~/.ssh" || true; \
-		fi; \
-	fi
-	@echo "--- 2. Running bootstrap install script ---"
-	ssh -o StrictHostKeyChecking=no root@$(SERVER) 'bash -s' < deploy/install.sh
-	@echo "--- 3. Pushing local configuration ---"
-	scp config.toml root@$(SERVER):/opt/mtproto-proxy/
-	@echo "--- 4. Deploying binary & restarting ---"
-	$(MAKE) deploy SERVER=$(SERVER)
-	@if [ "$(UPDATE_DNS)" = "1" ] || [ "$(UPDATE_DNS)" = "true" ]; then \
-		echo "--- 5. Updating Cloudflare DNS ---"; \
-		$(MAKE) update-dns SERVER=$(SERVER); \
-	fi
-	@echo "--- MIGRATION COMPLETE ---"
+dashboard: ## Install the monitoring dashboard on the server
+	@if [ -z "$(SERVER)" ]; echo "Usage: make dashboard SERVER=<ip>" && exit 1; fi
+	ssh root@$(SERVER) 'mtbuddy setup dashboard'
 
-# Full migration + AmneziaWG tunnel (for servers where Telegram is blocked)
-deploy-tunnel:
-	@if [ -z "$(SERVER)" ]; then echo "Usage: make deploy-tunnel SERVER=<ip> AWG_CONF=<path> [PASSWORD=<pass>] [TUNNEL_MODE=direct|preserve|middleproxy]"; exit 1; fi
-	@if [ -z "$(AWG_CONF)" ]; then echo "AWG_CONF is required (path to AmneziaWG client config)"; exit 1; fi
-	@if [ ! -f "$(AWG_CONF)" ]; then echo "AWG_CONF file not found: $(AWG_CONF)"; exit 1; fi
-	@case "$(TUNNEL_MODE)" in direct|preserve|middleproxy) ;; *) echo "Invalid TUNNEL_MODE: $(TUNNEL_MODE). Allowed: direct, preserve, middleproxy"; exit 1 ;; esac
-	$(MAKE) migrate SERVER=$(SERVER) PASSWORD=$(PASSWORD)
-	@echo "--- Setting up AmneziaWG tunnel ---"
-	scp $(AWG_CONF) root@$(SERVER):/tmp/awg_client.conf
-	scp deploy/setup_tunnel.sh root@$(SERVER):/tmp/setup_tunnel.sh
-	scp deploy/setup_mask_monitor.sh root@$(SERVER):/tmp/setup_mask_monitor.sh
-	ssh root@$(SERVER) "install -m 0755 /tmp/setup_mask_monitor.sh /opt/mtproto-proxy/setup_mask_monitor.sh 2>/dev/null || true; bash /tmp/setup_tunnel.sh /tmp/awg_client.conf $(TUNNEL_MODE) && rm -f /tmp/awg_client.conf /tmp/setup_tunnel.sh /tmp/setup_mask_monitor.sh"
-
-# Add tunnel to existing installation
-deploy-tunnel-only:
-	@if [ -z "$(SERVER)" ]; then echo "Usage: make deploy-tunnel-only SERVER=<ip> AWG_CONF=<path> [TUNNEL_MODE=direct|preserve|middleproxy]"; exit 1; fi
-	@if [ -z "$(AWG_CONF)" ]; then echo "AWG_CONF is required (path to AmneziaWG client config)"; exit 1; fi
-	@case "$(TUNNEL_MODE)" in direct|preserve|middleproxy) ;; *) echo "Invalid TUNNEL_MODE: $(TUNNEL_MODE). Allowed: direct, preserve, middleproxy"; exit 1 ;; esac
-	scp $(AWG_CONF) root@$(SERVER):/tmp/awg_client.conf
-	scp deploy/setup_tunnel.sh root@$(SERVER):/tmp/setup_tunnel.sh
-	scp deploy/setup_mask_monitor.sh root@$(SERVER):/tmp/setup_mask_monitor.sh
-	ssh root@$(SERVER) "install -m 0755 /tmp/setup_mask_monitor.sh /opt/mtproto-proxy/setup_mask_monitor.sh 2>/dev/null || true; bash /tmp/setup_tunnel.sh /tmp/awg_client.conf $(TUNNEL_MODE) && rm -f /tmp/awg_client.conf /tmp/setup_tunnel.sh /tmp/setup_mask_monitor.sh"
-
-update-dns:
-	@if [ -z "$(SERVER)" ]; then echo "Usage: make update-dns SERVER=<ip>"; exit 1; fi
-	bash deploy/update_dns.sh $(SERVER)
-
-# Linux/VPS regression harness (memory/socket churn)
-stability-check:
-	@if [ -z "$(PID)" ]; then echo "Usage: make stability-check PID=<mtproto_pid> [HOST=127.0.0.1 PORT=443]"; exit 1; fi
-	python3 test/connection_stability_check.py --host $(HOST) --port $(PORT) --pid $(PID) --idle-cycles 5
-
-# Load-only mode (no /proc assertions, useful for quick local smoke)
-stability-check-load:
-	python3 test/connection_stability_check.py --host $(HOST) --port $(PORT)
-
-# Capacity probe (idle sockets; FD/socket ceiling)
-capacity-probe-idle:
-	python3 test/capacity_connections_probe.py --profile mtproto.zig --traffic-mode idle
-
-# Capacity probe (authenticated traffic; memory-efficiency comparison)
-capacity-probe-active:
-	python3 test/capacity_connections_probe.py --profile mtproto.zig --traffic-mode tls-auth
-
-# Deploy monitoring dashboard to server
-deploy-monitor:
-	@if [ -z "$(SERVER)" ]; then echo "Usage: make deploy-monitor SERVER=<ip>"; exit 1; fi
-	ssh root@$(SERVER) 'mkdir -p /opt/mtproto-proxy/monitor/static'
-	scp deploy/monitor/server.py root@$(SERVER):/opt/mtproto-proxy/monitor/server.py
-	scp deploy/monitor/static/index.html deploy/monitor/static/style.css deploy/monitor/static/app.js root@$(SERVER):/opt/mtproto-proxy/monitor/static/
-	ssh root@$(SERVER) 'bash -s' < deploy/monitor/install.sh
-
-# Open SSH tunnel to monitoring dashboard
-monitor:
-	@if [ -z "$(SERVER)" ]; then echo "Usage: make monitor SERVER=<ip>"; exit 1; fi
-	@echo "Opening tunnel to monitor dashboard..."
-	@echo "→ http://localhost:61208"
+dashboard-tunnel: ## Open SSH tunnel to the monitoring dashboard
+	@if [ -z "$(SERVER)" ]; echo "Usage: make dashboard-tunnel SERVER=<ip>" && exit 1; fi
+	@echo "Opening tunnel → http://localhost:61208"
 	ssh -L 61208:localhost:61208 root@$(SERVER)
+
+# ── testing ───────────────────────────────────────────────────────────────────
+
+test-stability: ## Run stability tests (Usage: make test-stability [PID=<pid>])
+	@if [ -z "$(PID)" ]; then \
+		echo "Running active stability check..."; \
+		python3 test/connection_stability_check.py --host 127.0.0.1 --port $(PORT); \
+	else \
+		echo "Running idle stability check on PID $(PID)..."; \
+		python3 test/connection_stability_check.py --host 127.0.0.1 --port $(PORT) --pid $(PID) --idle-cycles 5; \
+	fi
+
+test-capacity: ## Run capacity probes (Usage: make test-capacity [MODE=idle|tls-auth])
+	@MODE="$(if $(MODE),$(MODE),idle)"; \
+	echo "Running capacity probe in $$MODE mode..."; \
+	python3 test/capacity_connections_probe.py --profile mtproto.zig --traffic-mode $$MODE
+
+# ── release ───────────────────────────────────────────────────────────────────
+
+release: ## Create and push a new GitHub release (Usage: make release VERSION=vX.Y.Z)
+	@if [ -z "$(VERSION)" ]; echo "Usage: make release VERSION=v1.2.3" && exit 1; fi
+	@if git rev-parse "$(VERSION)" >/dev/null 2>&1; then echo "Tag $(VERSION) already exists"; exit 1; fi
+	git tag "$(VERSION)"
+	git push origin "$(VERSION)"
+	gh release create "$(VERSION)" --title "$(VERSION)" --generate-notes

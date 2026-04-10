@@ -12,4 +12,6 @@ config.toml
 .vscode/
 __pycache__
 *.json
-*.log
+*.logtest_poll.zig
+fix_tui.py
+test_list.zig
