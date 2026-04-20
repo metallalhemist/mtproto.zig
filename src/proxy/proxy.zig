@@ -147,8 +147,20 @@ const SubnetRateLimit = struct {
             const ip_bytes = std.mem.asBytes(&addr.in.sa.addr);
             return @as(u32, ip_bytes[0]) << 16 | @as(u32, ip_bytes[1]) << 8 | @as(u32, ip_bytes[2]);
         } else if (addr.any.family == posix.AF.INET6) {
-            // /48 subnet: first 6 bytes hashed to u32
             const ip6 = &addr.in6.sa.addr;
+
+            // Detect IPv4-mapped IPv6 (::ffff:a.b.c.d).
+            // On dual-stack [::] listeners every IPv4 client arrives in this form;
+            // without this branch all IPv4 clients would collapse to key 0 and the
+            // entire IPv4 internet would share a single /24 token bucket.
+            const is_ipv4_mapped = std.mem.eql(u8, ip6[0..10], &[_]u8{0} ** 10) and
+                ip6[10] == 0xff and ip6[11] == 0xff;
+            if (is_ipv4_mapped) {
+                // Apply IPv4 /24 logic on the embedded IPv4 octets (bytes 12..14).
+                return @as(u32, ip6[12]) << 16 | @as(u32, ip6[13]) << 8 | @as(u32, ip6[14]);
+            }
+
+            // Native IPv6 /48 subnet: hash first 6 bytes into u32.
             return @as(u32, ip6[0]) << 24 | @as(u32, ip6[1]) << 16 | @as(u32, ip6[2]) << 8 | @as(u32, ip6[3]) ^ (@as(u32, ip6[4]) << 8 | @as(u32, ip6[5]));
         }
         return 0;
@@ -418,8 +430,12 @@ const DynamicRecordSizer = struct {
     const ramp_byte_threshold: u64 = 128 * 1024;
 
     fn init(enabled: bool) DynamicRecordSizer {
+        // When DRS is disabled the user opted out of anti-DPI record-size
+        // masking, so there is no reason to keep clamping records to the
+        // probe-friendly 1369-byte size — doing so only hurts throughput.
+        // Start at the full TLS plaintext size and short-circuit ramp-up.
         return .{
-            .current_size = initial_size,
+            .current_size = if (enabled) initial_size else full_size,
             .records_sent = 0,
             .bytes_sent = 0,
             .enabled = enabled,
@@ -592,8 +608,11 @@ const ConnectionSlot = struct {
     relay_tls_body_pos: u16 = 0,
     relay_record_type: u8 = 0,
 
+    // Placeholder until `DynamicRecordSizer.init` is called with the runtime
+    // config value; kept consistent with the enabled=false invariant so the
+    // sizer is immediately usable even if init() is ever skipped.
     drs: DynamicRecordSizer = DynamicRecordSizer{
-        .current_size = DynamicRecordSizer.initial_size,
+        .current_size = DynamicRecordSizer.full_size,
         .records_sent = 0,
         .bytes_sent = 0,
         .enabled = false,
@@ -934,10 +953,18 @@ pub const ProxyState = struct {
     stats_mp_fallback: std.atomic.Value(u64),
 
     middle_proxy_lock: std.Thread.RwLock = .{},
+    // Regular (non-media) primary endpoints per DC 1..5. Matches `proxy_for N`
+    // lines in Telegram's getProxyConfig.
     middle_proxy_addrs_primary: [5]net.Address,
+    // Media primary endpoints per DC 1..5 (matches `proxy_for -N`). Telegram
+    // serves large-file traffic on a dedicated MP fleet; routing a media
+    // client through a regular MP causes downloads to stall.
+    middle_proxy_addrs_media_primary: [5]net.Address,
     middle_proxy_addr_203: net.Address,
     middle_proxy_addrs_dc4: [16]net.Address,
     middle_proxy_addrs_dc4_len: usize,
+    middle_proxy_addrs_media_dc4: [16]net.Address,
+    middle_proxy_addrs_media_dc4_len: usize,
     middle_proxy_addrs_203: [8]net.Address,
     middle_proxy_addrs_203_len: usize,
     middle_proxy_secret: [256]u8,
@@ -1050,9 +1077,12 @@ pub const ProxyState = struct {
             .stats_hs_timeout = std.atomic.Value(u64).init(0),
             .stats_mp_fallback = std.atomic.Value(u64).init(0),
             .middle_proxy_addrs_primary = constants.tg_middle_proxies_v4,
+            .middle_proxy_addrs_media_primary = constants.tg_media_middle_proxies_v4,
             .middle_proxy_addr_203 = constants.getDcAddressV4(203),
             .middle_proxy_addrs_dc4 = [_]net.Address{constants.tg_middle_proxies_v4[3]} ++ ([_]net.Address{constants.tg_middle_proxies_v4[3]} ** 15),
             .middle_proxy_addrs_dc4_len = 1,
+            .middle_proxy_addrs_media_dc4 = [_]net.Address{constants.tg_media_middle_proxies_v4[3]} ++ ([_]net.Address{constants.tg_media_middle_proxies_v4[3]} ** 15),
+            .middle_proxy_addrs_media_dc4_len = 1,
             .middle_proxy_addrs_203 = [_]net.Address{constants.getDcAddressV4(203)} ++ ([_]net.Address{constants.getDcAddressV4(203)} ** 7),
             .middle_proxy_addrs_203_len = 1,
             .middle_proxy_secret = default_middle_proxy_secret,
@@ -1276,17 +1306,25 @@ pub const ProxyState = struct {
 
     const MiddleProxySnapshot = struct {
         addrs_primary: [5]net.Address,
+        addrs_media_primary: [5]net.Address,
         addr_203: net.Address,
         addrs_dc4: [16]net.Address,
         addrs_dc4_len: usize,
+        addrs_media_dc4: [16]net.Address,
+        addrs_media_dc4_len: usize,
         addrs_203: [8]net.Address,
         addrs_203_len: usize,
         secret: [256]u8,
         secret_len: usize,
 
-        fn getForDc(self: *const MiddleProxySnapshot, dc_abs: usize) ?net.Address {
+        /// Pick the single primary endpoint for (dc_abs, media?). Media-path
+        /// traffic (client sent dc_idx<0) must go to the media MP fleet —
+        /// regular MPs will accept the handshake but throttle/stall large
+        /// transfers, which is exactly the "media тупит" symptom.
+        fn getForDc(self: *const MiddleProxySnapshot, dc_abs: usize, media: bool) ?net.Address {
             if (dc_abs == 203) return self.addr_203;
             if (dc_abs >= 1 and dc_abs <= self.addrs_primary.len) {
+                if (media) return self.addrs_media_primary[dc_abs - 1];
                 return self.addrs_primary[dc_abs - 1];
             }
             return null;
@@ -1299,9 +1337,12 @@ pub const ProxyState = struct {
 
         return .{
             .addrs_primary = self.middle_proxy_addrs_primary,
+            .addrs_media_primary = self.middle_proxy_addrs_media_primary,
             .addr_203 = self.middle_proxy_addr_203,
             .addrs_dc4 = self.middle_proxy_addrs_dc4,
             .addrs_dc4_len = self.middle_proxy_addrs_dc4_len,
+            .addrs_media_dc4 = self.middle_proxy_addrs_media_dc4,
+            .addrs_media_dc4_len = self.middle_proxy_addrs_media_dc4_len,
             .addrs_203 = self.middle_proxy_addrs_203,
             .addrs_203_len = self.middle_proxy_addrs_203_len,
             .secret = self.middle_proxy_secret,
@@ -1309,7 +1350,55 @@ pub const ProxyState = struct {
         };
     }
 
+    /// Refresh helper. Tries the default route first; on any network-class
+    /// failure AND when the config selects tunnel upstream, retries via
+    /// `curl --interface <tunnel>`. This is what makes the media MP cache
+    /// warm up correctly on censored hosts where `core.telegram.org` is
+    /// unreachable directly but reachable through the tunnel.
+    fn fetchMiddleProxyAsset(self: *ProxyState, allocator: std.mem.Allocator, url: []const u8) ![]u8 {
+        if (fetchUrlBytes(allocator, url)) |bytes| {
+            return bytes;
+        } else |direct_err| {
+            const tunnel_iface = blk: {
+                if (self.config.upstream_mode != .tunnel) break :blk null;
+                break :blk self.config.upstream_tunnel_interface;
+            };
+            const iface = tunnel_iface orelse return direct_err;
+            log.info(
+                "Middle-proxy asset {s} unreachable directly ({s}); retrying via tunnel '{s}'",
+                .{ url, @errorName(direct_err), iface },
+            );
+            return fetchUrlBytesViaInterface(allocator, url, iface);
+        }
+    }
+
     fn middleProxyUpdaterMain(self: *ProxyState) void {
+        // Initial refresh runs before the proxy event loop starts, so on a
+        // censored host it typically fails (tunnel handshake may not be up yet).
+        // Do a short-cycle retry loop early, then fall back to the normal
+        // 24-hour cadence. This gets media MP addresses into the cache within
+        // the first few minutes of uptime instead of the next day.
+        const short_retries: [5]u64 = .{
+            10 * std.time.ns_per_s,
+            30 * std.time.ns_per_s,
+            60 * std.time.ns_per_s,
+            5 * 60 * std.time.ns_per_s,
+            30 * 60 * std.time.ns_per_s,
+        };
+        var retry_idx: usize = 0;
+        while (retry_idx < short_retries.len) : (retry_idx += 1) {
+            std.Thread.sleep(short_retries[retry_idx]);
+            if (self.refreshMiddleProxyInfo()) |_| {
+                break;
+            } else |err| {
+                if (isMiddleProxyRefreshNetworkError(err)) {
+                    log.info("Middle-proxy early retry unavailable ({s}), will try again", .{@errorName(err)});
+                } else {
+                    log.warn("Middle-proxy early retry failed: {any}", .{err});
+                }
+            }
+        }
+
         while (true) {
             std.Thread.sleep(middle_proxy_update_period_ns);
             self.refreshMiddleProxyInfo() catch |err| {
@@ -1339,14 +1428,25 @@ pub const ProxyState = struct {
         defer arena.deinit();
         const temp_alloc = arena.allocator();
 
-        const cfg_bytes = try fetchUrlBytes(temp_alloc, middle_proxy_config_url);
+        // Fetch config + secret. When the proxy runs inside a censored network
+        // (e.g. RU), core.telegram.org is unreachable over the default route;
+        // we transparently retry through the configured tunnel interface so
+        // the runtime MP cache (including media endpoints) stays up to date.
+        const cfg_bytes = self.fetchMiddleProxyAsset(temp_alloc, middle_proxy_config_url) catch |err| return err;
+        const next_secret = self.fetchMiddleProxyAsset(temp_alloc, middle_proxy_secret_url) catch |err| return err;
 
         var next_primary: [5]?net.Address = [_]?net.Address{null} ** 5;
+        var next_media_primary: [5]?net.Address = [_]?net.Address{null} ** 5;
         var next_dc4_candidates: [16]net.Address = undefined;
         var next_dc4_candidates_len: usize = 0;
+        var next_media_dc4_candidates: [16]net.Address = undefined;
+        var next_media_dc4_candidates_len: usize = 0;
         for (0..next_primary.len) |i| {
+            const dc_num: i16 = @intCast(i + 1);
+
+            // Regular (positive dc_idx) — used for non-media traffic.
             var candidates: [16]net.Address = undefined;
-            const count = parseMiddleProxyAddressesForDc(cfg_bytes, @as(i16, @intCast(i + 1)), &candidates);
+            const count = parseMiddleProxyAddressesForDc(cfg_bytes, dc_num, .positive_only, &candidates);
 
             if (i == 3 and count > 0) {
                 const dc4_n = @min(count, next_dc4_candidates.len);
@@ -1362,10 +1462,31 @@ pub const ProxyState = struct {
                 reachable
             else
                 candidates[0];
+
+            // Media (negative dc_idx) — Telegram uses a separate MP fleet for
+            // large file routing. Mixing the two causes media downloads to
+            // stall (what looks like "tormozit" on photo/video load).
+            var media_candidates: [16]net.Address = undefined;
+            const media_count = parseMiddleProxyAddressesForDc(cfg_bytes, dc_num, .negative_only, &media_candidates);
+
+            if (i == 3 and media_count > 0) {
+                const m4_n = @min(media_count, next_media_dc4_candidates.len);
+                @memcpy(next_media_dc4_candidates[0..m4_n], media_candidates[0..m4_n]);
+                next_media_dc4_candidates_len = m4_n;
+            }
+
+            next_media_primary[i] = if (media_count == 0)
+                null
+            else if (i == 3)
+                media_candidates[0]
+            else if (trySelectReachableMiddleProxy(media_candidates[0..media_count], 1200)) |reachable|
+                reachable
+            else
+                media_candidates[0];
         }
 
         var candidates_203: [8]net.Address = undefined;
-        const count_203 = parseMiddleProxyAddressesForDc(cfg_bytes, 203, &candidates_203);
+        const count_203 = parseMiddleProxyAddressesForDc(cfg_bytes, 203, .any, &candidates_203);
         var next_203_candidates: [8]net.Address = undefined;
         var next_203_candidates_len: usize = 0;
         if (count_203 > 0) {
@@ -1374,8 +1495,6 @@ pub const ProxyState = struct {
             next_203_candidates_len = c203_n;
         }
         const next_addr_203 = if (count_203 == 0) null else candidates_203[0];
-
-        const next_secret = try fetchUrlBytes(temp_alloc, middle_proxy_secret_url);
 
         if (next_secret.len < 16 or next_secret.len > self.middle_proxy_secret.len) {
             return error.BadMiddleProxySecret;
@@ -1392,6 +1511,22 @@ pub const ProxyState = struct {
                     self.middle_proxy_addrs_primary[i] = addr;
                     changed = true;
                 }
+            }
+            if (next_media_primary[i]) |addr| {
+                if (!self.middle_proxy_addrs_media_primary[i].eql(addr)) {
+                    self.middle_proxy_addrs_media_primary[i] = addr;
+                    changed = true;
+                }
+            }
+        }
+
+        if (next_media_dc4_candidates_len > 0) {
+            if (self.middle_proxy_addrs_media_dc4_len != next_media_dc4_candidates_len or
+                !addressesEqual(self.middle_proxy_addrs_media_dc4[0..self.middle_proxy_addrs_media_dc4_len], next_media_dc4_candidates[0..next_media_dc4_candidates_len]))
+            {
+                @memcpy(self.middle_proxy_addrs_media_dc4[0..next_media_dc4_candidates_len], next_media_dc4_candidates[0..next_media_dc4_candidates_len]);
+                self.middle_proxy_addrs_media_dc4_len = next_media_dc4_candidates_len;
+                changed = true;
             }
         }
 
@@ -1630,7 +1765,22 @@ const EventLoop = struct {
             const cfd = posix.accept(self.listen_fd, &client_addr.any, &client_len, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK) catch |err| {
                 switch (err) {
                     error.WouldBlock => return,
-                    error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => {
+
+                    // TCP three-way-handshake aborts between the kernel's
+                    // accept queue and our accept() call. These are benign —
+                    // bubbling them up causes the whole batch to abort and
+                    // (worse) starves other connections waiting in the queue.
+                    error.ConnectionAborted, error.ConnectionResetByPeer => continue,
+
+                    // Resource exhaustion: either we hit an FD limit or the
+                    // kernel ran out of socket buffers (ENOBUFS). In LT epoll
+                    // mode the listen socket stays readable, so returning the
+                    // error here without pausing would spin the event loop at
+                    // 100% CPU. Pause accepts with back-off instead.
+                    error.ProcessFdQuotaExceeded,
+                    error.SystemFdQuotaExceeded,
+                    error.SystemResources,
+                    => {
                         self.pauseAccepting(err);
                         return;
                     },
@@ -2266,7 +2416,17 @@ const EventLoop = struct {
     }
 
     fn finishClientHandshake(self: *EventLoop, slot: *ConnectionSlot) void {
-        const result = obfuscation.ObfuscationParams.fromHandshake(&slot.handshake_buf, self.state.user_secrets) orelse {
+        // The user and their secret were already resolved during FakeTLS
+        // validation (`onTlsClientHelloComplete`), so the obfuscation
+        // parameters can be derived in strict O(1) instead of iterating the
+        // full user list with a SHA-256 + AES-CTR per candidate. With large
+        // configs (hundreds of users) this saves a significant amount of CPU
+        // per handshake and shrinks the DPI-probe amplification factor.
+        const known_secret = [_]obfuscation.UserSecret{.{
+            .name = slot.validation_user[0..slot.validation_user_len],
+            .secret = slot.validation_secret,
+        }};
+        const result = obfuscation.ObfuscationParams.fromHandshake(&slot.handshake_buf, &known_secret) orelse {
             self.closeSlot(slot, "bad mtproto obfuscation handshake");
             return;
         };
@@ -2543,11 +2703,22 @@ const EventLoop = struct {
                     return;
                 }
 
+                // Telegram DCs (and MiddleProxies) never speak first after a
+                // SOCKS5 CONNECT success — they wait for our 64-byte handshake
+                // nonce. Any bytes piggy-backed onto the SOCKS5 reply are either
+                // garbage from a misbehaving upstream or an active MITM probe.
+                //
+                // Critically, `slot.pipelined_data` is the *client-side* pipeline
+                // buffer: on startRelay it is fed through `client_decryptor.apply`.
+                // Mixing upstream bytes into it desynchronises the client CTR
+                // stream (and, with MiddleProxy, encapsulates garbage into a
+                // valid RPC_PROXY_REQ frame). Drop the connection instead.
                 if (have.len > result.consumed) {
-                    self.appendPipelined(slot, have[result.consumed..]) catch {
-                        self.closeSlot(slot, "socks5 pipelined append failed");
-                        return;
-                    };
+                    log.warn("[{d}] socks5 upstream sent {d} unsolicited bytes after CONNECT success", .{
+                        slot.conn_id, have.len - result.consumed,
+                    });
+                    self.closeSlot(slot, "socks5 unsolicited upstream data");
+                    return;
                 }
 
                 // SOCKS5 handshake complete — proceed to DC path
@@ -2671,11 +2842,16 @@ const EventLoop = struct {
             return;
         }
 
+        // Same invariant as SOCKS5: the DC never speaks first. Any bytes the
+        // HTTP proxy appended after the "200 OK" line would be wrongly routed
+        // through the *client* decryption path in startRelay, corrupting the
+        // CTR stream. Reject the upstream.
         if (have.len > result.header_end) {
-            self.appendPipelined(slot, have[result.header_end..]) catch {
-                self.closeSlot(slot, "http connect pipelined append failed");
-                return;
-            };
+            log.warn("[{d}] http connect upstream sent {d} unsolicited bytes after 2xx", .{
+                slot.conn_id, have.len - result.header_end,
+            });
+            self.closeSlot(slot, "http connect unsolicited upstream data");
+            return;
         }
 
         // HTTP CONNECT handshake complete — proceed to DC path
@@ -3015,8 +3191,14 @@ const EventLoop = struct {
         var msg: [32]u8 = undefined;
         @memcpy(msg[0..4], &middleproxy.rpc_nonce_req);
         self.state.middle_proxy_lock.lockShared();
-        const key_sel_len = @min(@as(usize, 4), self.state.middle_proxy_secret_len);
-        @memcpy(msg[4..8], self.state.middle_proxy_secret[0..key_sel_len]);
+        // Defensive copy: refresh rejects secrets shorter than 16 bytes, but
+        // if that invariant is ever broken we must avoid a length-mismatched
+        // memcpy panic when filling the 4-byte key selector field.
+        @memset(msg[4..8], 0);
+        if (self.state.middle_proxy_secret_len > 0) msg[4] = self.state.middle_proxy_secret[0];
+        if (self.state.middle_proxy_secret_len > 1) msg[5] = self.state.middle_proxy_secret[1];
+        if (self.state.middle_proxy_secret_len > 2) msg[6] = self.state.middle_proxy_secret[2];
+        if (self.state.middle_proxy_secret_len > 3) msg[7] = self.state.middle_proxy_secret[3];
         self.state.middle_proxy_lock.unlockShared();
         @memcpy(msg[8..12], &middleproxy.rpc_crypto_aes);
         @memcpy(msg[12..16], &crypto_ts);
@@ -3643,7 +3825,20 @@ const EventLoop = struct {
 
     fn ensureMpC2sScratch(self: *EventLoop) ![]u8 {
         if (self.mp_c2s_scratch) |buf| return buf;
-        const buf = try self.state.allocator.alloc(u8, self.state.config.middleProxyBufferBytes());
+
+        // Worst-case RPC_PROXY_REQ expansion.
+        // The smallest consumable input is a single abridged header byte with
+        // len_val=0 → 0-byte payload → encrypted_len = 96 with ad_tag.
+        // A pathological client pipelining 1MB of such bytes would expand to
+        // ~96MB of encapsulated frames. Sizing the scratch buffer to match
+        // keeps encapsulateC2S overflow-free under adversarial load and
+        // prevents the spurious connection drops observed in production.
+        //
+        // One allocation per EventLoop (single-threaded), so the memory cost
+        // is bounded regardless of connection count.
+        const mp_max_expansion: usize = 96;
+        const capacity = self.state.config.middleProxyBufferBytes() * mp_max_expansion + 256;
+        const buf = try self.state.allocator.alloc(u8, capacity);
         self.mp_c2s_scratch = buf;
         return buf;
     }
@@ -4042,6 +4237,65 @@ fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
     return reader.allocRemaining(allocator, .limited(1 * 1024 * 1024));
 }
 
+/// Fetch a URL by shelling out to `curl`, binding the outgoing socket to the
+/// given network interface. This is the censorship-aware refresh path: when
+/// the proxy host sits in a network where `core.telegram.org` is unreachable
+/// over the default route, but the tunnel interface (e.g. AWG) provides a
+/// clean path, we use curl as an off-the-shelf HTTPS client without pulling
+/// a full TLS stack into the proxy binary.
+fn fetchUrlBytesViaInterface(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    interface: []const u8,
+) ![]u8 {
+    // curl requires --interface and its value as separate argv elements; the
+    // `--interface=<iface>` form is a common shell idiom but not supported by
+    // every curl version, hence the split.
+    const argv = [_][]const u8{
+        "curl",
+        "--silent",
+        "--fail",
+        "--show-error",
+        "--location",
+        "--max-time",
+        "10",
+        "--interface",
+        interface,
+        url,
+    };
+
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &argv,
+        .max_output_bytes = 1 * 1024 * 1024,
+    }) catch |err| {
+        log.warn("curl fallback failed to spawn: {any}", .{err});
+        return error.UnexpectedConnectFailure;
+    };
+    // Free stderr regardless of outcome; stdout is returned to the caller.
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| {
+            if (code != 0) {
+                log.warn("curl {s} via {s} exited with {d}: {s}", .{
+                    url, interface, code,
+                    std.mem.trim(u8, result.stderr, " \t\r\n"),
+                });
+                allocator.free(result.stdout);
+                return error.UnexpectedConnectFailure;
+            }
+        },
+        else => {
+            log.warn("curl {s} via {s} terminated abnormally", .{ url, interface });
+            allocator.free(result.stdout);
+            return error.UnexpectedConnectFailure;
+        },
+    }
+
+    return result.stdout;
+}
+
 fn parseIpv4Literal(text: []const u8) ?[4]u8 {
     var parts = std.mem.splitScalar(u8, text, '.');
     var ip: [4]u8 = undefined;
@@ -4248,7 +4502,14 @@ fn buildDcConnectPlan(
 
     var middle_addr: ?net.Address = null;
     if (snapshot) |snap| {
-        middle_addr = snap.getForDc(dc_abs);
+        middle_addr = snap.getForDc(dc_abs, plan.is_media_path);
+        if (middle_addr == null and plan.is_media_path) {
+            // Media pool is empty in this snapshot (e.g. first run, refresh
+            // hasn't succeeded yet and bundled media list is mis-seeded).
+            // Fall back to the regular MP — connections still complete, just
+            // without media-optimized routing.
+            middle_addr = snap.getForDc(dc_abs, false);
+        }
     }
 
     const force_media_middle_proxy = cfg.force_media_middle_proxy and plan.is_media_path and middle_addr != null;
@@ -4265,10 +4526,17 @@ fn buildDcConnectPlan(
     }
 
     if (snapshot) |snap| {
-        if (dc_abs == 4 and snap.addrs_dc4_len > 0) {
-            var n: usize = 0;
-            while (n < snap.addrs_dc4_len and plan.count < plan.candidates.len) : (n += 1) {
-                appendUniqueAddress(&plan.candidates, &plan.count, snap.addrs_dc4[n]);
+        if (dc_abs == 4) {
+            if (plan.is_media_path and snap.addrs_media_dc4_len > 0) {
+                var n: usize = 0;
+                while (n < snap.addrs_media_dc4_len and plan.count < plan.candidates.len) : (n += 1) {
+                    appendUniqueAddress(&plan.candidates, &plan.count, snap.addrs_media_dc4[n]);
+                }
+            } else if (snap.addrs_dc4_len > 0) {
+                var n: usize = 0;
+                while (n < snap.addrs_dc4_len and plan.count < plan.candidates.len) : (n += 1) {
+                    appendUniqueAddress(&plan.candidates, &plan.count, snap.addrs_dc4[n]);
+                }
             }
         } else if (dc_abs == 203 and snap.addrs_203_len > 0) {
             var n: usize = 0;
@@ -4299,7 +4567,18 @@ fn buildDcConnectPlan(
     return plan;
 }
 
-fn parseMiddleProxyAddressesForDc(config_text: []const u8, target_dc: i16, out: []net.Address) usize {
+const DcSignFilter = enum {
+    any, // accept proxy_for with dc == target_dc (any sign) — legacy
+    positive_only, // only `proxy_for  N  addr;` — regular traffic
+    negative_only, // only `proxy_for -N  addr;` — media traffic (dc_idx < 0)
+};
+
+fn parseMiddleProxyAddressesForDc(
+    config_text: []const u8,
+    target_dc: i16,
+    sign: DcSignFilter,
+    out: []net.Address,
+) usize {
     if (out.len == 0) return 0;
 
     var lines = std.mem.splitScalar(u8, config_text, '\n');
@@ -4318,7 +4597,12 @@ fn parseMiddleProxyAddressesForDc(config_text: []const u8, target_dc: i16, out: 
         const host_port = parts.next() orelse continue;
 
         const dc_idx = std.fmt.parseInt(i16, dc_text, 10) catch continue;
-        if (dc_idx != target_dc and dc_idx != -target_dc) continue;
+        const abs_target: i16 = if (target_dc < 0) -target_dc else target_dc;
+        switch (sign) {
+            .any => if (dc_idx != abs_target and dc_idx != -abs_target) continue,
+            .positive_only => if (dc_idx != abs_target) continue,
+            .negative_only => if (dc_idx != -abs_target) continue,
+        }
 
         const parsed = net.Address.parseIpAndPort(host_port) catch continue;
 
@@ -4376,7 +4660,8 @@ fn isAddressReachable(address: net.Address, timeout_ms: i32) bool {
 
 fn parseMiddleProxyAddressForDc(config_text: []const u8, target_dc: i16) ?net.Address {
     var one: [1]net.Address = undefined;
-    const n = parseMiddleProxyAddressesForDc(config_text, target_dc, &one);
+    const sign: DcSignFilter = if (target_dc < 0) .negative_only else .positive_only;
+    const n = parseMiddleProxyAddressesForDc(config_text, target_dc, sign, &one);
     if (n == 0) return null;
     return one[0];
 }
@@ -4663,9 +4948,12 @@ test "direct users bypass middle-proxy routing" {
             mp_dc4,
             constants.tg_middle_proxies_v4[4],
         },
+        .addrs_media_primary = constants.tg_media_middle_proxies_v4,
         .addr_203 = mp_dc203,
         .addrs_dc4 = [_]net.Address{mp_dc4} ++ ([_]net.Address{mp_dc4} ** 15),
         .addrs_dc4_len = 1,
+        .addrs_media_dc4 = [_]net.Address{constants.tg_media_middle_proxies_v4[3]} ++ ([_]net.Address{constants.tg_media_middle_proxies_v4[3]} ** 15),
+        .addrs_media_dc4_len = 1,
         .addrs_203 = [_]net.Address{mp_dc203} ++ ([_]net.Address{mp_dc203} ** 7),
         .addrs_203_len = 1,
         .secret = [_]u8{0} ** 256,
@@ -4691,11 +4979,15 @@ test "direct users bypass middle-proxy routing" {
     try std.testing.expect(admin_media.candidates[0].eql(constants.getDcAddressV4(203)));
 }
 
-test "DRS disabled fixed size" {
+test "DRS disabled skips ramp and uses full TLS record size" {
+    // Regression: prior behaviour initialised `current_size` to the probe-
+    // friendly 1369-byte size even when the user disabled DRS, bottlenecking
+    // downstream throughput forever. Disabled DRS must start (and stay) at
+    // the full TLS plaintext size.
     var drs = DynamicRecordSizer.init(false);
-    try std.testing.expectEqual(DynamicRecordSizer.initial_size, drs.nextRecordSize());
+    try std.testing.expectEqual(DynamicRecordSizer.full_size, drs.nextRecordSize());
     for (0..32) |_| drs.recordSent(1369);
-    try std.testing.expectEqual(DynamicRecordSizer.initial_size, drs.nextRecordSize());
+    try std.testing.expectEqual(DynamicRecordSizer.full_size, drs.nextRecordSize());
 }
 
 test "DRS enabled ramps" {
@@ -4800,6 +5092,31 @@ test "subnet rate limit - subnet key groups /24 IPv4" {
 
     try std.testing.expectEqual(key1, key2); // same /24
     try std.testing.expect(key1 != key3); // different /24
+}
+
+test "subnet rate limit - IPv4-mapped IPv6 keys match native IPv4 /24" {
+    // On dual-stack [::] listeners IPv4 clients arrive as ::ffff:a.b.c.d.
+    // Regression: prior to the mapped-detection branch every mapped address
+    // produced key = 0, collapsing the whole IPv4 internet into one bucket.
+    const native_v4 = net.Address.initIp4(.{ 203, 0, 113, 42 }, 443);
+
+    const mapped_bytes = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff } ++ [_]u8{ 203, 0, 113, 42 };
+    const mapped = net.Address.initIp6(mapped_bytes, 443, 0, 0);
+
+    const k_native = SubnetRateLimit.subnetKey(native_v4);
+    const k_mapped = SubnetRateLimit.subnetKey(mapped);
+    try std.testing.expectEqual(k_native, k_mapped);
+
+    // Two different mapped /24s must diverge (otherwise we'd still have the
+    // global IPv4 collision after the fix).
+    const mapped_other_bytes = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff } ++ [_]u8{ 198, 51, 100, 1 };
+    const mapped_other = net.Address.initIp6(mapped_other_bytes, 443, 0, 0);
+    try std.testing.expect(SubnetRateLimit.subnetKey(mapped_other) != k_mapped);
+
+    // Native IPv6 path must stay on the /48 hash (not collide with mapped form).
+    const native6_bytes = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12;
+    const native6 = net.Address.initIp6(native6_bytes, 443, 0, 0);
+    try std.testing.expect(SubnetRateLimit.subnetKey(native6) != k_mapped);
 }
 
 test "subnet rate limit - allows up to max then blocks" {
